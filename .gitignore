@@ -2,3 +2,13 @@ target/
 .DS_Store
 .tmp-gpui-component/
 **/mutants.out*/
+# prometheus-context-bootstrap
+.prometheus/.writer.lock
+.prometheus/.review-pending
+.claude/settings.json.bak.*
+
+# local tooling state
+compass-out/
+.agent-team/recovery/
+.claude/settings.local.json
+.prometheus/recovery/

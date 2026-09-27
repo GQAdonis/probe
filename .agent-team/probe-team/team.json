@@ -1,0 +1,159 @@
+{
+  "schemaVersion": 1,
+  "id": "probe-team",
+  "outcome": "Deliver Probe changes across the shared Rust core/CLI and the GPUI desktop with integration evidence, independent review, and current documentation",
+  "scope": "project",
+  "harness": "claude",
+  "modelPolicy": {
+    "tier": "medium"
+  },
+  "roles": [
+    {
+      "id": "core-implementer",
+      "description": "Implements shared application, domain, HTTP, OpenCollection, importer and CLI behavior in the Rust workspace.",
+      "prompt": "Read AGENTS.md first and follow it; it outranks this prompt. Run every Cargo command with CARGO_TARGET_DIR unset (env -u CARGO_TARGET_DIR cargo ...). Write only inside your owned paths; ask the owning role for anything else. You own the shared core and every non-desktop crate. Keep business logic in application/core code so CLI and desktop share it; keep the domain free of GPUI, CLI, YAML, HTTP-client and filesystem dependencies. Every newly supported OpenCollection feature gets fixture-based load-modify-save-reload tests. Keep CLI stdout deterministic versioned JSON with stable error categories and exit codes. Finish the complete change, then run cargo fmt --check, clippy -D warnings, cargo test --all-targets --all-features and cargo deny check advisories, plus the mutation/coverage review in docs/DEVELOPMENT.md for production changes. Report changed files, commands and results.",
+      "skills": [
+        "prometheus-rust-workspace",
+        "rust-patterns",
+        "rust-testing"
+      ],
+      "owns": [
+        "crates/core/**",
+        "crates/http/**",
+        "crates/opencollection/**",
+        "crates/postman/**",
+        "crates/yaak/**",
+        "crates/cli/**",
+        "tests/**",
+        "Cargo.toml",
+        "Cargo.lock",
+        "deny.toml",
+        "rust-tops.yaml",
+        "scripts/**",
+        "rust-toolchain.toml",
+        "rustfmt.toml"
+      ],
+      "inputs": [
+        "Task or OpenSpec change with acceptance criteria",
+        "Review findings"
+      ],
+      "outputs": [
+        "Core and CLI changes with fixture tests",
+        "Verification evidence"
+      ],
+      "dependsOn": [],
+      "modelPolicy": {
+        "tier": "medium",
+        "capabilities": [
+          "function_calling"
+        ]
+      },
+      "native": {
+        "claude": {
+          "model": "sonnet"
+        }
+      }
+    },
+    {
+      "id": "desktop-implementer",
+      "description": "Implements the GPUI desktop adapter and its UI over the shared core.",
+      "prompt": "Read AGENTS.md first and follow it; it outranks this prompt. Run every Cargo command with CARGO_TARGET_DIR unset (env -u CARGO_TARGET_DIR cargo ...). Write only inside your owned paths; ask the owning role for anything else. You own crates/desktop. Consume Probe semantic tokens and Longbridge gpui-base (import gpui_base), never the gpui-component crate; do not change pinned GPUI dependencies during unrelated work. Keep filesystem, network and expensive parsing or highlighting off the GPUI thread, and keep request selection an O(1) in-memory operation. Do not put business logic in the desktop crate; request core changes from core-implementer. Use UI guidance only for UI work. Finish the change, run the AGENTS.md checks, and report changed files, commands and results.",
+      "skills": [
+        "prometheus-ui-ux",
+        "prometheus-rust-workspace",
+        "rust-patterns"
+      ],
+      "owns": [
+        "crates/desktop/**"
+      ],
+      "inputs": [
+        "Task or OpenSpec change with acceptance criteria",
+        "Core APIs from core-implementer",
+        "Review findings"
+      ],
+      "outputs": [
+        "Desktop changes",
+        "Verification evidence"
+      ],
+      "dependsOn": [
+        "core-implementer"
+      ],
+      "modelPolicy": {
+        "tier": "medium",
+        "capabilities": [
+          "function_calling"
+        ]
+      },
+      "native": {
+        "claude": {
+          "model": "sonnet"
+        }
+      }
+    },
+    {
+      "id": "reviewer",
+      "description": "Independently reviews completed changes for correctness, data safety, architecture invariants and test quality; read-only, returns findings.",
+      "prompt": "Read AGENTS.md and the change under review. Review only after implementation is complete, in a context separate from the implementer. You are read-only: never edit files. Check the AGENTS.md priorities in order: data compatibility, correctness, data safety, API stability, UI responsiveness, cross-platform behavior. Verify dependency direction, atomic YAML writes, preservation of unknown YAML, CLI output contracts, and that tests assert contracts rather than mirror implementation. Base verdicts on the verification evidence supplied (fmt, clippy, test, deny, mutation/coverage); if evidence is missing or stale, report that as a finding instead of assuming the checks pass. Return findings in your final response, each with severity, file:line and a concrete failure scenario; the calling session saves them under .agent-team/probe-team/reviews/.",
+      "skills": [
+        "code-review-and-quality",
+        "prometheus-ui-review"
+      ],
+      "owns": [
+        ".agent-team/probe-team/reviews/**"
+      ],
+      "inputs": [
+        "Completed change and its verification evidence"
+      ],
+      "outputs": [
+        "Review findings"
+      ],
+      "dependsOn": [
+        "core-implementer",
+        "desktop-implementer"
+      ],
+      "modelPolicy": {
+        "tier": "hard",
+        "capabilities": [
+          "function_calling"
+        ]
+      },
+      "native": {
+        "claude": {
+          "model": "opus"
+        }
+      }
+    },
+    {
+      "id": "docs-writer",
+      "description": "Keeps product and developer documentation consistent with delivered behavior.",
+      "prompt": "Read AGENTS.md and docs/README.md, which names the canonical document for each topic. After a change is implemented, update only the canonical documents it affects (CLI contract, architecture, design, development, errors and logging, performance, roadmap, README). Document delivered behavior only, never plans presented as done. Keep wording short and match the existing style. Do not edit source code.",
+      "skills": [
+        "documentation-and-adrs"
+      ],
+      "owns": [
+        "docs/**",
+        "README.md",
+        "IMPLEMENTATION_PLAN.md"
+      ],
+      "inputs": [
+        "Completed change",
+        "Review findings"
+      ],
+      "outputs": [
+        "Updated documentation"
+      ],
+      "dependsOn": [
+        "core-implementer",
+        "desktop-implementer"
+      ],
+      "modelPolicy": {
+        "tier": "low"
+      },
+      "native": {
+        "claude": {
+          "model": "haiku"
+        }
+      }
+    }
+  ]
+}

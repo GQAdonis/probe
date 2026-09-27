@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "compass": {
+      "type": "stdio",
+      "command": "compass",
+      "args": [
+        "serve",
+        "--graph",
+        "compass-out/graph.json"
+      ],
+      "env": {}
+    }
+  }
+}
