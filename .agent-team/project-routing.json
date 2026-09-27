@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "activeTeam": "probe-team",
+  "manifest": ".agent-team/probe-team/team.json",
+  "target": "claude",
+  "nativeDefinitions": [
+    ".claude/agents/core-implementer.md",
+    ".claude/agents/desktop-implementer.md",
+    ".claude/agents/reviewer.md",
+    ".claude/agents/docs-writer.md"
+  ],
+  "instructionFiles": [
+    "AGENTS.md",
+    "CLAUDE.md"
+  ],
+  "delegation": "native-definitions",
+  "limitations": [
+    "Native definition presence is not live invocation evidence. The active harness owns permissions, models, concurrency and delegation.",
+    "When delegation is unavailable, use selected role instructions sequentially and report it; builder-context review is not independent.",
+    "Zed external ACP agents use their native configuration; Zed parallel threads are not an automatic delegation API."
+  ]
+}
