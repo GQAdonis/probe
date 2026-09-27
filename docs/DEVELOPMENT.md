@@ -39,6 +39,10 @@ without explicit approval.
 Keep shared fixtures under `tests/fixtures/`. CLI integration tests cover command
 behavior, JSON output, and exit codes.
 
+When tests inspect or compare text files, account for platform line endings. Windows
+may check out fixtures with CRLF (`\r\n`), so avoid assuming LF (`\n`) unless the
+test explicitly normalizes line endings or the format requires them.
+
 Do not automate visual constants such as spacing, radii, typography sizes, palette
 values, or contrast ratios. Review those visually against [DESIGN.md](DESIGN.md).
 Desktop tests may cover behavior such as appearance selection, pane constraints,
