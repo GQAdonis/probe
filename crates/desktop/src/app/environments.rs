@@ -50,13 +50,20 @@ impl ProbeApp {
             .as_ref()
             .is_some_and(|dialog| {
                 !dialog.draft.name.trim().is_empty()
-                    && dialog.draft.variables.iter().all(|variable| {
-                        !matches!(
-                            variable,
-                            EnvironmentVariable::Plain(variable)
-                                if variable.name.as_deref().is_none_or(|name| name.trim().is_empty())
-                        )
-                    })
+                    && dialog
+                        .draft
+                        .variables
+                        .iter()
+                        .all(|variable| match variable {
+                            EnvironmentVariable::Plain(variable) => variable
+                                .name
+                                .as_deref()
+                                .is_some_and(|name| !name.trim().is_empty()),
+                            EnvironmentVariable::Secret(variable) => variable
+                                .name
+                                .as_deref()
+                                .is_some_and(|name| !name.trim().is_empty()),
+                        })
             })
     }
 
@@ -114,6 +121,7 @@ impl ProbeApp {
             return;
         };
         self.environment_manager_dialog = Some(EnvironmentManagerDialog::new(selected));
+        self.refresh_secret_statuses(cx);
         self.clear_environment_dialog_error(cx);
         self.environment_manager_dialog_focus.focus(window, cx);
         cx.notify();
@@ -149,6 +157,9 @@ impl ProbeApp {
     }
 
     pub(super) fn discard_environment_manager_dialog(&mut self) {
+        self.secret_status_task = None;
+        self.secret_status_generation = self.secret_status_generation.wrapping_add(1);
+        self.secret_value_dialog = None;
         self.transient.environment_manager_context_menu = None;
         self.environment_manager_close_after_save = false;
         self.environment_manager_dialog = None;
@@ -263,6 +274,7 @@ impl ProbeApp {
             .find(|environment| environment.name == name)
         {
             self.environment_manager_dialog = Some(EnvironmentManagerDialog::new(environment));
+            self.refresh_secret_statuses(cx);
             self.clear_environment_dialog_error(cx);
             cx.notify();
         }
@@ -270,6 +282,27 @@ impl ProbeApp {
 
     pub(super) fn save_environment_manager_dialog(
         &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_environment_manager_save(false, window, cx);
+    }
+
+    pub(super) fn confirm_stored_secret_rename(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_environment_manager_save(true, window, cx);
+        if self.environment_save_task.is_none() {
+            self.environment_manager_close_after_save = false;
+            self.restore_environment_dialog_focus(window, cx);
+        }
+    }
+
+    fn finish_environment_manager_save(
+        &mut self,
+        acknowledged: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -292,18 +325,21 @@ impl ProbeApp {
         let mut replacement = dialog.draft.clone();
         replacement.name = replacement.name.trim().to_owned();
         for variable in &mut replacement.variables {
-            if let EnvironmentVariable::Plain(variable) = variable
-                && let Some(name) = variable.name.as_mut()
-            {
+            let name = match variable {
+                EnvironmentVariable::Plain(variable) => &mut variable.name,
+                EnvironmentVariable::Secret(variable) => &mut variable.name,
+            };
+            if let Some(name) = name.as_mut() {
                 *name = name.trim().to_owned();
             }
         }
-        let invalid_variable = replacement.variables.iter().any(|variable| {
-            matches!(
-                variable,
-                EnvironmentVariable::Plain(variable)
-                    if variable.name.as_deref().is_none_or(str::is_empty)
-            )
+        let invalid_variable = replacement.variables.iter().any(|variable| match variable {
+            EnvironmentVariable::Plain(variable) => {
+                variable.name.as_deref().is_none_or(str::is_empty)
+            }
+            EnvironmentVariable::Secret(variable) => {
+                variable.name.as_deref().is_none_or(str::is_empty)
+            }
         });
         if replacement.name.is_empty() || invalid_variable {
             self.show_environment_dialog_error(
@@ -316,6 +352,7 @@ impl ProbeApp {
         }
         let original_name = dialog.original_name.clone();
         let saved_name = replacement.name.clone();
+        let replacement_for_warning = replacement.clone();
         let Some(loaded) = &self.loaded_workspace else {
             return;
         };
@@ -331,6 +368,30 @@ impl ProbeApp {
                 return;
             }
         };
+        let rename_warning = if acknowledged {
+            None
+        } else {
+            self.loaded_workspace.as_ref().and_then(|loaded| {
+                let original = loaded
+                    .workspace()
+                    .environments()
+                    .iter()
+                    .find(|environment| environment.name == original_name)?;
+                stored_secret_rename_warning(
+                    loaded.workspace().environments(),
+                    original,
+                    &replacement_for_warning,
+                )
+            })
+        };
+        if let Some(kind) = rename_warning {
+            self.show_application_dialog(
+                ApplicationDialog::RenameStoredSecrets { kind },
+                window,
+                cx,
+            );
+            return;
+        }
         self.environment_save_workspace_path = self.workspace_path.clone();
         self.environment_save_task = Some(cx.spawn_in(window, async move |view, window| {
             let result = window
@@ -360,6 +421,7 @@ impl ProbeApp {
                                 } else {
                                     view.environment_manager_dialog =
                                         Some(EnvironmentManagerDialog::new(&environment));
+                                    view.refresh_secret_statuses(cx);
                                 }
                             }
                         }
@@ -723,4 +785,85 @@ impl ProbeApp {
         }));
         cx.notify();
     }
+}
+
+pub(super) fn stored_secret_rename_warning(
+    environments: &[Environment],
+    original: &Environment,
+    replacement: &Environment,
+) -> Option<StoredSecretRename> {
+    if original.name != replacement.name
+        && environment_has_secret_declaration(environments, original)
+    {
+        return Some(StoredSecretRename::Environment);
+    }
+    match direct_secret_renames(original, replacement).as_slice() {
+        [] => None,
+        [(from, to)] => Some(StoredSecretRename::Variable {
+            from: from.clone(),
+            to: to.clone(),
+        }),
+        _ => Some(StoredSecretRename::Variables),
+    }
+}
+
+fn environment_has_secret_declaration(
+    environments: &[Environment],
+    environment: &Environment,
+) -> bool {
+    probe_core::effective_environment_variables(environments, environment)
+        .iter()
+        .any(|row| {
+            matches!(
+                &row.variable,
+                EnvironmentVariable::Secret(secret)
+                    if secret
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| !name.trim().is_empty())
+            )
+        })
+}
+
+fn direct_secret_renames(
+    original: &Environment,
+    replacement: &Environment,
+) -> Vec<(String, String)> {
+    let before = trimmed_secret_names(original);
+    let after = trimmed_secret_names(replacement);
+    names_absent_from(&before, &after)
+        .into_iter()
+        .zip(names_absent_from(&after, &before))
+        .collect()
+}
+
+fn trimmed_secret_names(environment: &Environment) -> Vec<String> {
+    environment
+        .variables
+        .iter()
+        .filter_map(|variable| match variable {
+            EnvironmentVariable::Secret(secret) => secret
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
+            EnvironmentVariable::Plain(_) => None,
+        })
+        .collect()
+}
+
+fn names_absent_from(source: &[String], other: &[String]) -> Vec<String> {
+    let mut remaining = BTreeMap::<&str, usize>::new();
+    for name in other {
+        *remaining.entry(name.as_str()).or_default() += 1;
+    }
+    let mut absent = Vec::new();
+    for name in source {
+        match remaining.get_mut(name.as_str()) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => absent.push(name.clone()),
+        }
+    }
+    absent
 }

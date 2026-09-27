@@ -523,7 +523,12 @@ impl ProbeApp {
             (ApplicationDialog::UnsavedEnvironment, ApplicationDialogAction::Save) => {
                 self.environment_manager_close_after_save = true;
                 self.save_environment_manager_dialog(window, cx);
-                if self.environment_save_task.is_none() {
+                if self.environment_save_task.is_none()
+                    && !matches!(
+                        self.application_dialog,
+                        Some(ApplicationDialog::RenameStoredSecrets { .. })
+                    )
+                {
                     self.environment_manager_close_after_save = false;
                     self.restore_environment_dialog_focus(window, cx);
                 }
@@ -542,6 +547,20 @@ impl ProbeApp {
                 ApplicationDialog::DeleteEnvironment { name, .. },
                 ApplicationDialogAction::Delete,
             ) => self.delete_environment(name, window, cx),
+            (
+                ApplicationDialog::DeleteStoredSecret {
+                    name, environment, ..
+                },
+                ApplicationDialogAction::Delete,
+            ) => self.delete_stored_secret(name, environment, window, cx),
+            (ApplicationDialog::RenameStoredSecrets { .. }, ApplicationDialogAction::Rename) => {
+                self.confirm_stored_secret_rename(window, cx)
+            }
+            (ApplicationDialog::RenameStoredSecrets { .. }, ApplicationDialogAction::Cancel) => {
+                self.environment_manager_close_after_save = false;
+                self.restore_environment_dialog_focus(window, cx);
+                cx.notify();
+            }
             (
                 ApplicationDialog::FilesystemConflict { path, .. },
                 ApplicationDialogAction::UseDisk,
@@ -956,6 +975,9 @@ impl ProbeApp {
         self.remap_structure_dialog(&reconciled.selector_remaps);
         self.create_environment_dialog = None;
         self.sync_environment_manager_after_reload(environment_manager_reload, cx);
+        if self.environment_manager_dialog.is_some() && !self.environment_manager_is_dirty() {
+            self.refresh_secret_statuses(cx);
+        }
         if self.shell.selected_environment().is_some_and(|name| {
             !self
                 .loaded_workspace
