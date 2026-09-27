@@ -101,8 +101,15 @@ diff. Then:
 
 ```bash
 git diff --unified=0 HEAD > target/mutants.diff
-cargo mutants --workspace --in-diff target/mutants.diff -j 2
+scripts/run-mutants.sh target/mutants.diff
 ```
+
+The wrapper gives cargo-mutants' jobserver about half of the detected logical
+CPUs for Cargo/rustc builds, then divides that budget across its two mutant
+jobs for Rust test-framework threads (both counts have a minimum of one).
+Set `MUTANTS_JOBSERVER_TASKS` or `MUTANTS_TEST_THREADS` to override either
+count. These conservative concurrency limits reduce sustained CPU saturation,
+heat, and fan noise during local mutation runs; they are not a hard CPU cap.
 
 For a PR branch, use `git diff --unified=0 origin/main...HEAD` to include
 committed changes. CI runs this gate only on PRs that change Rust source in the
