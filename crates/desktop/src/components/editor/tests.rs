@@ -90,9 +90,12 @@ fn variable_tooltip_presentation_creates_missing_writable_variables() {
     assert!(empty.hint.is_none());
 
     let secret = variable_tooltip_presentation("token", &variables);
-    assert_eq!(secret.value, "unavailable");
+    assert!(secret.value.is_empty());
     assert!(!secret.editable);
-    assert_eq!(secret.hint, Some("Secret has no value in this environment"));
+    assert_eq!(secret.secret, Some(SecretTooltipState::NotStored));
+    assert!(secret.hint.is_none());
+    assert_eq!(secret.secret.unwrap().status_text(), "○ Not set");
+    assert_eq!(secret.secret.unwrap().action_label(), "Set Secret…");
 
     let stored = VariableContext {
         resolved_secrets: ["apiKey".to_owned()].into_iter().collect(),
@@ -107,7 +110,26 @@ fn variable_tooltip_presentation_creates_missing_writable_variables() {
     let stored_tooltip = variable_tooltip_presentation("apiKey", &stored);
     assert!(stored_tooltip.value.is_empty());
     assert!(!stored_tooltip.editable);
-    assert_eq!(stored_tooltip.hint, Some("Secret value stored securely"));
+    assert_eq!(stored_tooltip.secret, Some(SecretTooltipState::Stored));
+    assert!(stored_tooltip.hint.is_none());
+    assert_eq!(
+        stored_tooltip.secret.unwrap().status_text(),
+        "● Stored securely"
+    );
+    assert_eq!(
+        stored_tooltip.secret.unwrap().action_label(),
+        "Replace Secret…"
+    );
+    for theme in [Theme::light(), Theme::dark()] {
+        assert_eq!(
+            stored_tooltip.secret.unwrap().status_color(theme),
+            theme.colors.status.success
+        );
+        assert_eq!(
+            secret.secret.unwrap().status_color(theme),
+            theme.colors.text.muted
+        );
+    }
     assert!(!stored.values.contains_key("apiKey"));
     let palette = variable_highlight_palette(Theme::light());
     let (color, underline) =
@@ -122,8 +144,22 @@ fn variable_tooltip_presentation_creates_missing_writable_variables() {
     let unknown_tooltip = variable_tooltip_presentation("secretToken", &unknown);
     assert!(unknown_tooltip.value.is_empty());
     assert!(!unknown_tooltip.editable);
-    assert!(unknown_tooltip.show_lock);
-    assert_eq!(unknown_tooltip.hint, Some("Secret presence not verified"));
+    assert_eq!(unknown_tooltip.secret, Some(SecretTooltipState::Unknown));
+    assert!(unknown_tooltip.hint.is_none());
+    assert_eq!(
+        unknown_tooltip.secret.unwrap().status_text(),
+        "Not verified"
+    );
+    assert_eq!(
+        unknown_tooltip.secret.unwrap().action_label(),
+        "Set Secret…"
+    );
+    for theme in [Theme::light(), Theme::dark()] {
+        assert_eq!(
+            unknown_tooltip.secret.unwrap().status_color(theme),
+            theme.colors.text.muted
+        );
+    }
     assert_ne!(
         unknown.status("secretToken"),
         VariableStatus::SecretWithoutValue

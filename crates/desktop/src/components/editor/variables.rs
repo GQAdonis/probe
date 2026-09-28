@@ -107,7 +107,14 @@ pub(in crate::components) fn variable_input_overlay(
             .child(hits),
     );
 
-    with_variable_tooltip(wrapper, theme, hover, variables, cx)
+    with_variable_tooltip(
+        wrapper,
+        theme,
+        hover,
+        variables,
+        state.read(cx).focus_handle(cx),
+        cx,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -188,7 +195,14 @@ pub(super) fn variable_editor_overlay(
         window.request_animation_frame();
     }
     wrapper = wrapper.child(hits);
-    with_variable_tooltip(wrapper, theme, hover, variables, cx)
+    with_variable_tooltip(
+        wrapper,
+        theme,
+        hover,
+        variables,
+        state.read(cx).focus_handle(cx),
+        cx,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -247,6 +261,7 @@ fn with_variable_tooltip(
     theme: Theme,
     hover: Entity<VariableHoverState>,
     variables: VariableContext,
+    editor_focus: FocusHandle,
     cx: &App,
 ) -> gpui::AnyElement {
     let (open, active, bounds) = {
@@ -279,7 +294,8 @@ fn with_variable_tooltip(
                         presentation,
                         hover,
                         value_input,
-                        variables.on_manage_environments,
+                        variables,
+                        editor_focus,
                     )),
             )
             .with_priority(POPUP_PRIORITY + 1),
@@ -605,23 +621,11 @@ pub(in crate::components) fn variable_tooltip_presentation(
     variables: &VariableContext,
 ) -> VariableTooltipPresentation {
     if variables.unknown_secrets.contains(name) {
-        return VariableTooltipPresentation {
-            value: String::new(),
-            placeholder: "Secret value",
-            editable: false,
-            hint: Some("Secret presence not verified"),
-            show_lock: true,
-        };
+        return VariableTooltipPresentation::secret(SecretTooltipState::Unknown);
     }
     match variables.status(name) {
         VariableStatus::Resolved if variables.resolved_secrets.contains(name) => {
-            VariableTooltipPresentation {
-                value: String::new(),
-                placeholder: "Secret value",
-                editable: false,
-                hint: Some("Secret value stored securely"),
-                show_lock: false,
-            }
+            VariableTooltipPresentation::secret(SecretTooltipState::Stored)
         }
         VariableStatus::Resolved => VariableTooltipPresentation {
             value: variables
@@ -632,21 +636,17 @@ pub(in crate::components) fn variable_tooltip_presentation(
             placeholder: "Variable value",
             editable: variables.on_change.is_some(),
             hint: None,
-            show_lock: false,
+            secret: None,
         },
-        VariableStatus::SecretWithoutValue => VariableTooltipPresentation {
-            value: variables.unavailable_message.clone(),
-            placeholder: "Variable value",
-            editable: false,
-            hint: Some("Secret has no value in this environment"),
-            show_lock: false,
-        },
+        VariableStatus::SecretWithoutValue => {
+            VariableTooltipPresentation::secret(SecretTooltipState::NotStored)
+        }
         VariableStatus::Missing if variables.on_change.is_some() => VariableTooltipPresentation {
             value: String::new(),
             placeholder: "Enter a value to create",
             editable: true,
             hint: Some("Not defined in this environment"),
-            show_lock: false,
+            secret: None,
         },
         VariableStatus::Missing => unavailable_variable_tooltip(&variables.unavailable_message),
     }
@@ -658,7 +658,7 @@ fn unavailable_variable_tooltip(message: &str) -> VariableTooltipPresentation {
         placeholder: "Variable value",
         editable: false,
         hint: None,
-        show_lock: false,
+        secret: None,
     }
 }
 
@@ -667,7 +667,50 @@ pub(in crate::components) struct VariableTooltipPresentation {
     pub(in crate::components) placeholder: &'static str,
     pub(in crate::components) editable: bool,
     pub(in crate::components) hint: Option<&'static str>,
-    pub(in crate::components) show_lock: bool,
+    pub(in crate::components) secret: Option<SecretTooltipState>,
+}
+
+impl VariableTooltipPresentation {
+    fn secret(state: SecretTooltipState) -> Self {
+        Self {
+            value: String::new(),
+            placeholder: "Secret value",
+            editable: false,
+            hint: None,
+            secret: Some(state),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::components) enum SecretTooltipState {
+    Stored,
+    NotStored,
+    Unknown,
+}
+
+impl SecretTooltipState {
+    pub(in crate::components) fn status_text(self) -> &'static str {
+        match self {
+            Self::Stored => "● Stored securely",
+            Self::NotStored => "○ Not set",
+            Self::Unknown => "Not verified",
+        }
+    }
+
+    pub(in crate::components) fn status_color(self, theme: Theme) -> gpui::Rgba {
+        match self {
+            Self::Stored => theme.colors.status.success,
+            Self::NotStored | Self::Unknown => theme.colors.text.muted,
+        }
+    }
+
+    pub(in crate::components) fn action_label(self) -> &'static str {
+        match self {
+            Self::Stored => "Replace Secret…",
+            Self::NotStored | Self::Unknown => "Set Secret…",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
