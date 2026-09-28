@@ -20,13 +20,50 @@ pub(crate) enum ImportSource {
 pub(crate) struct EnvironmentManagerDialog {
     pub(crate) original_name: String,
     pub(crate) draft: Environment,
+    pub(crate) secret_statuses: BTreeMap<String, SecretUiStatus>,
+    pub(crate) variable_row_ids: Vec<u64>,
+    pub(crate) next_variable_row_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SecretUiStatus {
+    Loading,
+    Stored,
+    /// A trusted operation learned that the credential is not stored.
+    NotStored,
+    /// Probe has not learned whether the credential exists.
+    Unknown,
 }
 
 impl EnvironmentManagerDialog {
     pub(crate) fn new(environment: &Environment) -> Self {
+        let next_variable_row_id = environment.variables.len() as u64;
         Self {
             original_name: environment.name.clone(),
             draft: environment.clone(),
+            secret_statuses: BTreeMap::new(),
+            variable_row_ids: (0..next_variable_row_id).collect(),
+            next_variable_row_id,
+        }
+    }
+
+    pub(crate) fn add_variable(&mut self, variable: probe_core::EnvironmentVariable) {
+        self.draft.variables.push(variable);
+        self.variable_row_ids.push(self.next_variable_row_id);
+        self.next_variable_row_id += 1;
+    }
+
+    pub(crate) fn sync_variable_row_ids(&mut self) {
+        while self.variable_row_ids.len() < self.draft.variables.len() {
+            self.variable_row_ids.push(self.next_variable_row_id);
+            self.next_variable_row_id += 1;
+        }
+    }
+
+    pub(crate) fn remove_variable(&mut self, index: usize) {
+        if index < self.draft.variables.len() {
+            self.draft.variables.remove(index);
+            self.variable_row_ids.remove(index);
         }
     }
 }
@@ -41,12 +78,19 @@ pub(crate) enum PendingClose {
     Quit,
     Open {
         path: PathBuf,
-        restored_state: Option<SessionState>,
+        restored_state: Option<Box<SessionState>>,
     },
     Create {
         path: PathBuf,
     },
     Import(ImportSource),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum StoredSecretRename {
+    Environment,
+    Variable { from: String, to: String },
+    Variables,
 }
 
 pub(crate) enum ApplicationDialog {
@@ -64,6 +108,14 @@ pub(crate) enum ApplicationDialog {
     DeleteEnvironment {
         name: String,
         detail: String,
+    },
+    DeleteStoredSecret {
+        name: String,
+        environment: String,
+        detail: String,
+    },
+    RenameStoredSecrets {
+        kind: StoredSecretRename,
     },
     UnsavedEnvironment,
     FilesystemConflict {
@@ -153,6 +205,16 @@ impl ApplicationDialog {
             Self::Delete { name, .. } | Self::DeleteEnvironment { name, .. } => {
                 Cow::Owned(format!("Delete “{name}”?"))
             }
+            Self::DeleteStoredSecret { .. } => Cow::Borrowed("Delete stored value?"),
+            Self::RenameStoredSecrets {
+                kind: StoredSecretRename::Environment,
+            } => Cow::Borrowed("Rename environment?"),
+            Self::RenameStoredSecrets {
+                kind: StoredSecretRename::Variable { .. },
+            } => Cow::Borrowed("Rename secret variable?"),
+            Self::RenameStoredSecrets {
+                kind: StoredSecretRename::Variables,
+            } => Cow::Borrowed("Rename secret variables?"),
             Self::FilesystemConflict { .. } => {
                 Cow::Borrowed("Collection changes conflict with local edits")
             }
@@ -167,27 +229,39 @@ impl ApplicationDialog {
         }
     }
 
-    pub(crate) fn description(&self) -> &str {
+    pub(crate) fn description(&self) -> Cow<'_, str> {
         match self {
-            Self::About => concat!(
+            Self::About => Cow::Borrowed(concat!(
                 "Version ",
                 env!("CARGO_PKG_VERSION"),
                 "\n\nA fast, native, local-first API client."
-            ),
+            )),
             Self::Unsaved { .. } | Self::UnsavedEnvironment => {
-                "Unsaved changes will be lost if you discard them."
+                Cow::Borrowed("Unsaved changes will be lost if you discard them.")
             }
             Self::Delete { detail, .. }
             | Self::DeleteEnvironment { detail, .. }
+            | Self::DeleteStoredSecret { detail, .. }
             | Self::FilesystemConflict { detail, .. }
             | Self::ConfirmPartialYaakImport { detail, .. }
-            | Self::ConfirmPartialPostmanImport { detail, .. } => detail,
+            | Self::ConfirmPartialPostmanImport { detail, .. } => Cow::Borrowed(detail),
+            Self::RenameStoredSecrets {
+                kind: StoredSecretRename::Environment,
+            } => Cow::Borrowed(ENVIRONMENT_SECRET_RENAME_DETAIL),
+            Self::RenameStoredSecrets {
+                kind: StoredSecretRename::Variables,
+            } => Cow::Borrowed(SECRET_VARIABLES_RENAME_DETAIL),
+            Self::RenameStoredSecrets {
+                kind: StoredSecretRename::Variable { from, to },
+            } => Cow::Owned(format!(
+                "Stored secret values are associated with the variable name.\nAfter renaming {from} to {to}, its value will need to be stored again."
+            )),
             Self::SelectYaakWorkspace { .. } => {
-                "Choose the workspace to import into a new Probe collection."
+                Cow::Borrowed("Choose the workspace to import into a new Probe collection.")
             }
-            Self::SelectCollectionFile { .. } => {
-                "This folder contains multiple bundled OpenCollection files. Choose one to open."
-            }
+            Self::SelectCollectionFile { .. } => Cow::Borrowed(
+                "This folder contains multiple bundled OpenCollection files. Choose one to open.",
+            ),
         }
     }
 
@@ -206,6 +280,8 @@ impl ApplicationDialog {
             Self::About => Some(ABOUT_DIALOG_ACTIONS),
             Self::Unsaved { .. } | Self::UnsavedEnvironment => Some(UNSAVED_DIALOG_ACTIONS),
             Self::Delete { .. } | Self::DeleteEnvironment { .. } => Some(DELETE_DIALOG_ACTIONS),
+            Self::DeleteStoredSecret { .. } => Some(DELETE_STORED_VALUE_DIALOG_ACTIONS),
+            Self::RenameStoredSecrets { .. } => Some(RENAME_STORED_SECRETS_DIALOG_ACTIONS),
             Self::FilesystemConflict { .. } => Some(FILESYSTEM_CONFLICT_DIALOG_ACTIONS),
             Self::SelectYaakWorkspace { .. } => None,
             Self::SelectCollectionFile { .. } => None,
@@ -255,6 +331,7 @@ pub(crate) enum ApplicationDialogAction {
     Delete,
     UseDisk,
     KeepLocal,
+    Rename,
     SelectWorkspace(usize),
     SelectCollectionFile(usize),
     ImportSupportedData,
@@ -311,11 +388,31 @@ const UNSAVED_DIALOG_ACTIONS: &[DialogActionSpec] = &[
         ApplicationDialogAction::Save,
     ),
 ];
+const ENVIRONMENT_SECRET_RENAME_DETAIL: &str = "Stored secret values are associated with the environment name.\nAfter renaming, affected secrets will need to be stored again.\n\nThe existing stored credentials will not be migrated.";
+const SECRET_VARIABLES_RENAME_DETAIL: &str = "Stored secret values are associated with the variable name.\nAfter renaming, affected secrets will need to be stored again.\n\nThe existing stored credentials will not be migrated.";
+const RENAME_STORED_SECRETS_DIALOG_ACTIONS: &[DialogActionSpec] = &[
+    CANCEL_DIALOG_ACTION,
+    DialogActionSpec::new(
+        "application-dialog-rename",
+        "Rename",
+        components::DialogActionStyle::Primary,
+        ApplicationDialogAction::Rename,
+    ),
+];
 const DELETE_DIALOG_ACTIONS: &[DialogActionSpec] = &[
     CANCEL_DIALOG_ACTION,
     DialogActionSpec::new(
         "application-dialog-delete",
         "Delete",
+        components::DialogActionStyle::Destructive,
+        ApplicationDialogAction::Delete,
+    ),
+];
+const DELETE_STORED_VALUE_DIALOG_ACTIONS: &[DialogActionSpec] = &[
+    CANCEL_DIALOG_ACTION,
+    DialogActionSpec::new(
+        "application-dialog-delete-stored-value",
+        "Delete Stored Value",
         components::DialogActionStyle::Destructive,
         ApplicationDialogAction::Delete,
     ),

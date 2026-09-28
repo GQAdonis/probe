@@ -15,21 +15,35 @@ impl ProbeApp {
         else {
             return;
         };
-        let selected_environment = self.shell.selected_environment().map(str::to_owned);
-        let request = if let Some(environment_name) = selected_environment {
-            let Some(loaded) = &self.loaded_workspace else {
-                return;
-            };
-            match resolve_environment(loaded.workspace().environments(), &environment_name)
-                .and_then(|environment| resolve_request(&request, &environment))
-            {
-                Ok(request) => request,
-                Err(error) => {
-                    self.execution.fail(key, error.to_string());
-                    self.response_viewer.remove(key);
-                    cx.notify();
+        let native_environment = self.shell.selected_environment().and_then(|name| {
+            self.loaded_workspace.as_ref().and_then(|loaded| {
+                loaded.source_path().map(|path| {
+                    (
+                        loaded.workspace().environments().to_vec(),
+                        name.to_owned(),
+                        path.to_owned(),
+                    )
+                })
+            })
+        });
+        let request = if native_environment.is_none() {
+            if let Some(name) = self.shell.selected_environment() {
+                let Some(loaded) = &self.loaded_workspace else {
                     return;
+                };
+                match resolve_environment(loaded.workspace().environments(), name)
+                    .and_then(|environment| resolve_request(&request, &environment))
+                {
+                    Ok(request) => request,
+                    Err(error) => {
+                        self.execution.fail(key, error.to_string());
+                        self.response_viewer.remove(key);
+                        cx.notify();
+                        return;
+                    }
                 }
+            } else {
+                request
             }
         } else {
             request
@@ -42,7 +56,7 @@ impl ProbeApp {
             response_cache: Some(self.response_cache.clone()),
         };
         if self.execution_service.is_none() {
-            match ExecutionService::new() {
+            match ExecutionService::with_credentials(Arc::clone(&self.credential_store)) {
                 Ok(service) => self.execution_service = Some(service),
                 Err(error) => {
                     self.execution
@@ -55,11 +69,22 @@ impl ProbeApp {
         }
         let (cancellation_sender, cancellation_receiver) = tokio::sync::oneshot::channel();
         let generation = self.execution.begin(key, cancellation_sender);
-        let (result_receiver, mut progress_receiver) = self
-            .execution_service
-            .as_ref()
-            .unwrap()
-            .execute(request, options, output, cancellation_receiver);
+        let (result_receiver, mut progress_receiver, presence_receiver) =
+            self.execution_service.as_ref().unwrap().execute(
+                request,
+                native_environment,
+                options,
+                output,
+                cancellation_receiver,
+            );
+        let presence_revision = self.credential_presence_revision;
+        cx.spawn(async move |view, cx| {
+            let presence = presence_receiver.await.unwrap_or_default();
+            let _ = view.update(cx, |view, cx| {
+                view.apply_secret_presence_reconciliation(presence, presence_revision, cx);
+            });
+        })
+        .detach();
 
         cx.spawn(async move |view, cx| {
             while let Some(progress) = progress_receiver.recv().await {

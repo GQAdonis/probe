@@ -4,6 +4,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
     time::Duration,
 };
 
@@ -18,17 +19,18 @@ use gpui::{
 };
 #[cfg(target_os = "macos")]
 use gpui::{Menu, MenuItem, OsAction, SystemMenuType};
-use gpui_base::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
+use gpui_base::input::{Copy, Cut, InputEvent, InputState, Paste, Redo, SelectAll, Undo};
 use gpui_base::{
-    AutoScroll, Button, POPUP_PRIORITY, Popover, Positioner, Scrollbar, ScrollbarMode, Tab, Tabs,
-    ToastStack,
+    AutoScroll, Button, Input, POPUP_PRIORITY, Popover, Positioner, Scrollbar, ScrollbarMode, Tab,
+    Tabs, ToastStack,
 };
 use probe_core::{
     AuthenticationKind, AuthenticationValue, Body, Collection, Environment, EnvironmentVariable,
     FileReference, FormField, Header, MultipartPart, MultipartPartKind, MultipartValue,
-    QueryParameter, RawBodyKind, Request, RequestBody, RequestKey, Variable, VariableValue,
-    VariableValueSet, WorkspaceItemRef, add_path_parameter, ensure_path_parameters_from_url,
-    remove_path_parameter_at, rename_path_parameter_at, resolve_environment, resolve_request,
+    QueryParameter, RawBodyKind, Request, RequestBody, RequestKey, SecretVariable, Variable,
+    VariableValue, VariableValueSet, WorkspaceItemRef, add_path_parameter,
+    ensure_path_parameters_from_url, remove_path_parameter_at, rename_path_parameter_at,
+    resolve_environment, resolve_request,
 };
 use probe_http::{ExecutionOptions, HttpError, HttpResponse};
 use probe_opencollection::{
@@ -48,6 +50,7 @@ mod interactions;
 mod presentation;
 mod render;
 mod response;
+mod secrets;
 mod session_state;
 mod structure;
 mod tabs;
@@ -60,8 +63,9 @@ pub(crate) use dialogs::IMPORT_DIAGNOSTIC_GROUP_LIMIT;
 use dialogs::{
     ApplicationDialog, ApplicationDialogAction, CANCEL_DIALOG_ACTION, DesktopMenu,
     DesktopMenuDefinition, DesktopMenuItem, DesktopSubmenu, DialogActionSpec,
-    EnvironmentManagerDialog, ImportSource, PendingClose, PostmanConversionResult,
-    YaakConversionResult, format_import_diagnostics, suggested_collection_filename,
+    EnvironmentManagerDialog, ImportSource, PendingClose, PostmanConversionResult, SecretUiStatus,
+    StoredSecretRename, YaakConversionResult, format_import_diagnostics,
+    suggested_collection_filename,
 };
 use presentation::{
     InspectListRow, PrettyRevealState, ShellSelectors, inspect_list_rows, inspect_row_index,
@@ -180,6 +184,7 @@ gpui::actions!(
         SubmitStructureDialog,
         SubmitCreateEnvironmentDialog,
         SubmitEnvironmentManagerDialog,
+        SubmitSecretValueDialog,
         SubmitApplicationDialog,
         SubmitApplicationDialogDestructive,
         CancelStructureDialog,
@@ -313,6 +318,13 @@ pub(crate) struct ProbeApp {
     structure_dialog: Option<StructureDialog>,
     create_environment_dialog: Option<String>,
     environment_manager_dialog: Option<EnvironmentManagerDialog>,
+    secret_value_dialog: Option<secrets::SecretValueDialog>,
+    editor_secret_identities: RefCell<Option<secrets::EditorSecretIdentityCache>>,
+    /// Advances when a successful Set or Delete changes credential presence.
+    /// In-flight execution reconciliation captured at an older revision is ignored.
+    credential_presence_revision: u64,
+    secret_write_in_progress: bool,
+    credential_store: Arc<dyn crate::credentials::CredentialStore>,
     environment_dialog_error: Option<EnvironmentDialogError>,
     application_dialog: Option<ApplicationDialog>,
     pending_application_dialogs: VecDeque<ApplicationDialog>,
@@ -324,6 +336,7 @@ pub(crate) struct ProbeApp {
     response_viewer: ResponseViewerState,
     tree_scroll: UniformListScrollHandle,
     inspector_scroll: UniformListScrollHandle,
+    environment_variables_scroll: UniformListScrollHandle,
     inspector_list_width: f32,
     inspector_resize_start: Option<(f32, f32)>,
     pending_inspector_reveal: Cell<Option<InspectSelection>>,
@@ -342,6 +355,8 @@ pub(crate) struct ProbeApp {
     rendered_sidebar_rows: usize,
     #[cfg(test)]
     rendered_response_rows: usize,
+    #[cfg(test)]
+    rendered_environment_variable_rows: usize,
     _caret_blink: Task<()>,
     _response_elapsed_refresh: Task<()>,
     _keystrokes: gpui::Subscription,
@@ -434,6 +449,11 @@ impl ProbeApp {
             structure_dialog: None,
             create_environment_dialog: None,
             environment_manager_dialog: None,
+            secret_value_dialog: None,
+            editor_secret_identities: RefCell::new(None),
+            credential_presence_revision: 0,
+            secret_write_in_progress: false,
+            credential_store: secrets::default_credential_store(),
             environment_dialog_error: None,
             application_dialog: None,
             pending_application_dialogs: VecDeque::new(),
@@ -445,6 +465,7 @@ impl ProbeApp {
             response_viewer: ResponseViewerState::default(),
             tree_scroll: UniformListScrollHandle::new(),
             inspector_scroll: UniformListScrollHandle::new(),
+            environment_variables_scroll: UniformListScrollHandle::new(),
             inspector_list_width: DEFAULT_INSPECT_LIST_WIDTH,
             inspector_resize_start: None,
             pending_inspector_reveal: Cell::new(None),
@@ -463,6 +484,8 @@ impl ProbeApp {
             rendered_sidebar_rows: 0,
             #[cfg(test)]
             rendered_response_rows: 0,
+            #[cfg(test)]
+            rendered_environment_variable_rows: 0,
             _caret_blink: Self::spawn_caret_blink(cx),
             _response_elapsed_refresh: Self::spawn_response_elapsed_refresh(cx),
             _keystrokes: keystrokes,
@@ -806,6 +829,7 @@ fn bind_platform_hotkeys(cx: &mut App) {
             Some("CreateEnvironmentDialog"),
         ),
         KeyBinding::new("enter", SubmitApplicationDialog, Some("ApplicationDialog")),
+        KeyBinding::new("enter", SubmitSecretValueDialog, Some("SecretValueDialog")),
         KeyBinding::new("escape", CancelStructureDialog, Some("StructureDialog")),
         KeyBinding::new(
             "escape",
@@ -816,6 +840,11 @@ fn bind_platform_hotkeys(cx: &mut App) {
             "escape",
             CancelEnvironmentManagerDialog,
             Some("EnvironmentManagerDialog"),
+        ),
+        KeyBinding::new(
+            "escape",
+            CancelEnvironmentManagerDialog,
+            Some("SecretValueDialog"),
         ),
         KeyBinding::new("escape", CancelApplicationDialog, Some("ApplicationDialog")),
         KeyBinding::new("ctrl-tab", FocusNextControl, None),

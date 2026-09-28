@@ -90,9 +90,86 @@ fn variable_tooltip_presentation_creates_missing_writable_variables() {
     assert!(empty.hint.is_none());
 
     let secret = variable_tooltip_presentation("token", &variables);
-    assert_eq!(secret.value, "unavailable");
+    assert!(secret.value.is_empty());
     assert!(!secret.editable);
-    assert_eq!(secret.hint, Some("Secret has no value in this environment"));
+    assert_eq!(secret.secret, Some(SecretTooltipState::NotStored));
+    assert!(secret.hint.is_none());
+    assert_eq!(secret.secret.unwrap().status_text(), "○ Not set");
+    assert_eq!(secret.secret.unwrap().action_label(), "Set Secret…");
+
+    let stored = VariableContext {
+        resolved_secrets: ["apiKey".to_owned()].into_iter().collect(),
+        on_change: Some(std::rc::Rc::new(|_, _, _, _| {})),
+        ..VariableContext::default()
+    };
+    assert_eq!(stored.status("apiKey"), VariableStatus::Resolved);
+    assert_eq!(
+        reference_status(&stored, ReferenceKind::Environment, "apiKey"),
+        VariableStatus::Resolved
+    );
+    let stored_tooltip = variable_tooltip_presentation("apiKey", &stored);
+    assert!(stored_tooltip.value.is_empty());
+    assert!(!stored_tooltip.editable);
+    assert_eq!(stored_tooltip.secret, Some(SecretTooltipState::Stored));
+    assert!(stored_tooltip.hint.is_none());
+    assert_eq!(
+        stored_tooltip.secret.unwrap().status_text(),
+        "● Stored securely"
+    );
+    assert_eq!(
+        stored_tooltip.secret.unwrap().action_label(),
+        "Replace Secret…"
+    );
+    for theme in [Theme::light(), Theme::dark()] {
+        assert_eq!(
+            stored_tooltip.secret.unwrap().status_color(theme),
+            theme.colors.status.success
+        );
+        assert_eq!(
+            secret.secret.unwrap().status_color(theme),
+            theme.colors.text.muted
+        );
+    }
+    assert!(!stored.values.contains_key("apiKey"));
+    let palette = variable_highlight_palette(Theme::light());
+    let (color, underline) =
+        super::variables::placeholder_paint(PlaceholderTone::Resolved, palette);
+    assert!(underline.is_none());
+    assert_eq!(color, palette.resolved);
+
+    let unknown = VariableContext {
+        unknown_secrets: ["secretToken".to_owned()].into_iter().collect(),
+        ..VariableContext::default()
+    };
+    let unknown_tooltip = variable_tooltip_presentation("secretToken", &unknown);
+    assert!(unknown_tooltip.value.is_empty());
+    assert!(!unknown_tooltip.editable);
+    assert_eq!(unknown_tooltip.secret, Some(SecretTooltipState::Unknown));
+    assert!(unknown_tooltip.hint.is_none());
+    assert_eq!(
+        unknown_tooltip.secret.unwrap().status_text(),
+        "Not verified"
+    );
+    assert_eq!(
+        unknown_tooltip.secret.unwrap().action_label(),
+        "Set Secret…"
+    );
+    for theme in [Theme::light(), Theme::dark()] {
+        assert_eq!(
+            unknown_tooltip.secret.unwrap().status_color(theme),
+            theme.colors.text.muted
+        );
+    }
+    assert_ne!(
+        unknown.status("secretToken"),
+        VariableStatus::SecretWithoutValue
+    );
+    let (color, underline) = super::variables::placeholder_paint(
+        placeholder_tone(&unknown, ReferenceKind::Environment, "secretToken"),
+        palette,
+    );
+    assert!(underline.is_none());
+    assert_eq!(color, palette.neutral);
 }
 
 #[test]
@@ -164,7 +241,8 @@ fn body_text_highlights_overlay_mustache_variables() {
     let value = "{\"host\":\"{{host}}\"}";
     let ranges = variable_ranges(value);
     let palette = stand_in_palette();
-    let highlights = body_text_highlights(value, &ranges, palette, |_, _| VariableStatus::Resolved);
+    let highlights =
+        body_text_highlights(value, &ranges, palette, |_, _| PlaceholderTone::Resolved);
     assert_eq!(highlights.len(), 1);
     assert_eq!(&value[highlights[0].range.clone()], "{{host}}");
     assert_eq!(highlights[0].style.color, Some(palette.resolved));
@@ -178,9 +256,9 @@ fn body_text_highlights_underline_unresolved_mustache_spans() {
     let palette = stand_in_palette();
     let highlights = body_text_highlights(value, &ranges, palette, |_, name| {
         if name == "host" {
-            VariableStatus::Resolved
+            PlaceholderTone::Resolved
         } else {
-            VariableStatus::Missing
+            PlaceholderTone::Unresolved
         }
     });
     assert_eq!(highlights.len(), 2);
@@ -210,7 +288,7 @@ fn variable_highlight_runs_color_only_mustache_spans() {
         strikethrough: None,
     };
     let runs = variable_highlight_runs(value, &ranges, &base, palette, |_, _| {
-        VariableStatus::Resolved
+        PlaceholderTone::Resolved
     });
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[0].color, palette.resolved);
@@ -235,9 +313,9 @@ fn variable_highlight_runs_underline_unresolved_mustache_spans() {
     };
     let runs = variable_highlight_runs(value, &ranges, &base, palette, |_, name| {
         if name == "host" {
-            VariableStatus::Resolved
+            PlaceholderTone::Resolved
         } else {
-            VariableStatus::SecretWithoutValue
+            PlaceholderTone::Unresolved
         }
     });
     assert_eq!(runs.len(), 3);
@@ -270,7 +348,7 @@ fn variable_highlight_runs_clamp_overlapping_url_placeholders() {
     let mut classified = Vec::new();
     let runs = variable_highlight_runs(value, &ranges, &base, palette, |kind, name| {
         classified.push((kind, name.to_owned()));
-        VariableStatus::Resolved
+        PlaceholderTone::Resolved
     });
     assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), value.len());
     assert_eq!(
@@ -356,7 +434,7 @@ fn variable_highlight_runs_paint_non_variable_text_with_the_base_color() {
     };
 
     let runs = variable_highlight_runs(value, &ranges, &base, palette, |_, _| {
-        VariableStatus::Resolved
+        PlaceholderTone::Resolved
     });
 
     assert_eq!(runs.len(), 3);
@@ -370,6 +448,7 @@ fn stand_in_palette() -> VariableHighlightPalette {
     VariableHighlightPalette {
         resolved: hsla(0.33, 0.6, 0.5, 1.0),
         unresolved: hsla(0.02, 0.75, 0.46, 1.0),
+        neutral: hsla(0.0, 0.0, 0.45, 1.0),
     }
 }
 

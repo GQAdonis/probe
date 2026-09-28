@@ -347,11 +347,19 @@ pub(crate) fn dialog_layer(
 
 type VariableChangeHandler = Rc<dyn Fn(&str, String, &mut Window, &mut App)>;
 type ManageEnvironmentsHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+type ManageSecretHandler = Rc<dyn Fn(&str, FocusHandle, &mut Window, &mut App)>;
 
 #[derive(Clone, Default)]
 pub(crate) struct VariableContext {
     pub(crate) values: BTreeMap<String, String>,
+    /// Enabled secrets a trusted operation learned are not stored.
     pub(crate) secrets: BTreeSet<String>,
+    /// Enabled secrets whose credential is known to be stored.
+    /// Names only: secret values never enter this set or `values`.
+    pub(crate) resolved_secrets: BTreeSet<String>,
+    /// Enabled secrets whose presence Probe has not learned.
+    /// Names only. Absence from `resolved_secrets` is not enough to mean missing.
+    pub(crate) unknown_secrets: BTreeSet<String>,
     /// Enabled path-parameter names with a non-empty value.
     ///
     /// `None` means this field does not highlight path placeholders, so every
@@ -360,10 +368,14 @@ pub(crate) struct VariableContext {
     pub(crate) unavailable_message: String,
     pub(crate) on_change: Option<VariableChangeHandler>,
     pub(crate) on_manage_environments: Option<ManageEnvironmentsHandler>,
+    pub(crate) on_manage_secret: Option<ManageSecretHandler>,
 }
 
 impl VariableContext {
     pub(crate) fn status(&self, name: &str) -> probe_core::VariableStatus {
+        if self.resolved_secrets.contains(name) {
+            return probe_core::VariableStatus::Resolved;
+        }
         probe_core::variable_status(&self.values, &self.secrets, name)
     }
 
@@ -397,6 +409,8 @@ impl std::fmt::Debug for VariableContext {
             .debug_struct("VariableContext")
             .field("values", &self.values)
             .field("secrets", &self.secrets)
+            .field("resolved_secrets", &self.resolved_secrets)
+            .field("unknown_secrets", &self.unknown_secrets)
             .field("path_values", &self.path_values)
             .field("unavailable_message", &self.unavailable_message)
             .finish_non_exhaustive()
@@ -594,9 +608,15 @@ pub(super) fn variable_tooltip_popup(
     presentation: VariableTooltipPresentation,
     hover: Entity<VariableHoverState>,
     value_input: Entity<InputState>,
-    on_manage_environments: Option<ManageEnvironmentsHandler>,
+    variables: VariableContext,
+    editor_focus: FocusHandle,
 ) -> impl IntoElement {
     let hover_for_content = hover.clone();
+    let secret = presentation.secret;
+    let status_text = secret
+        .map(|state| state.status_text())
+        .or(presentation.hint);
+    let status_color = secret.map_or(theme.colors.text.muted, |state| state.status_color(theme));
     div()
         .id("variable-input-tooltip-popup")
         .debug_selector(|| "variable-input-tooltip-popup".into())
@@ -616,38 +636,80 @@ pub(super) fn variable_tooltip_popup(
             let value_input = value_input.clone();
             move |_, window, cx| {
                 cx.stop_propagation();
-                value_input.update(cx, |input, cx| input.focus(window, cx));
+                if secret.is_none() {
+                    value_input.update(cx, |input, cx| input.focus(window, cx));
+                }
             }
         })
         .on_hover(move |hovered, _, cx| {
             hover_for_content.update(cx, |state, cx| state.on_content_hover(*hovered, cx));
         })
         .child(
-            truncated_label(format!("{{{{{name}}}}}"))
-                .flex_none()
-                .font_family(theme.typography.monospace_family)
-                .text_size(px(theme.typography.caption_size))
-                .text_color(theme.colors.syntax.string),
+            div()
+                .flex()
+                .items_center()
+                .gap(px(theme.metrics.spacing_1))
+                .when(secret.is_some(), |row| row.child(lock_icon(theme)))
+                .child(
+                    truncated_label(format!("{{{{{name}}}}}"))
+                        .flex_none()
+                        .font_family(theme.typography.monospace_family)
+                        .text_size(px(theme.typography.caption_size))
+                        .text_color(theme.colors.syntax.string),
+                ),
         )
-        .when_some(presentation.hint, |popup, hint| {
+        .when_some(status_text, |popup, hint| {
             popup.child(
-                truncated_label(hint)
+                div()
                     .id("variable-tooltip-create-hint")
                     .debug_selector(|| "variable-tooltip-create-hint".into())
+                    .flex()
                     .flex_none()
-                    .text_size(px(theme.typography.caption_size))
-                    .text_color(theme.colors.text.muted),
+                    .items_center()
+                    .justify_between()
+                    .gap(px(theme.metrics.spacing_2))
+                    .child(
+                        truncated_label(hint)
+                            .flex_1()
+                            .text_size(px(theme.typography.caption_size))
+                            .text_color(status_color),
+                    )
+                    .when_some(secret, |row, state| {
+                        row.when_some(variables.on_manage_secret.clone(), |row, on_manage| {
+                            let hover = hover.clone();
+                            let name = name.clone();
+                            row.child(
+                                secondary_button(
+                                    theme,
+                                    "variable-tooltip-secret-action",
+                                    state.action_label(),
+                                    move |_, window, cx| {
+                                        hover.update(cx, |state, cx| state.dismiss(cx));
+                                        on_manage(&name, editor_focus.clone(), window, cx);
+                                    },
+                                )
+                                .flex_none()
+                                .min_w(px(0.0))
+                                .h(px(theme.typography.caption_size + theme.metrics.spacing_3))
+                                .px(px(theme.metrics.spacing_2))
+                                .text_size(px(theme.typography.caption_size))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                            )
+                        })
+                    }),
             )
         })
-        .child(variable_value_input(
-            theme,
-            format!("variable-tooltip-value-{name}"),
-            value_input,
-            presentation.value,
-            presentation.placeholder,
-            presentation.editable,
-        ))
-        .when_some(on_manage_environments, |popup, on_manage| {
+        .when(secret.is_none(), |popup| {
+            popup.child(variable_value_input(
+                theme,
+                format!("variable-tooltip-value-{name}"),
+                value_input,
+                presentation.value,
+                presentation.placeholder,
+                presentation.editable,
+            ))
+        })
+        .when_some(variables.on_manage_environments, |popup, on_manage| {
             let hover = hover.clone();
             popup.child(
                 text_button(

@@ -176,7 +176,8 @@ impl Render for ProbeApp {
         #[cfg(test)]
         self.variable_context_frames
             .set(self.variable_context_frames.get() + 1);
-        self.frame_variable_context = Some(self.resolve_variable_context(cx));
+        let variable_context = self.resolve_variable_context(cx);
+        self.frame_variable_context = Some(variable_context);
 
         let root = div()
             .size_full()
@@ -379,6 +380,11 @@ impl Render for ProbeApp {
                 }),
             )
             .on_action(
+                cx.listener(|view, _: &SubmitSecretValueDialog, window, cx| {
+                    view.save_secret_value(window, cx);
+                }),
+            )
+            .on_action(
                 cx.listener(|view, _: &SubmitApplicationDialog, window, cx| {
                     view.submit_application_dialog_primary(window, cx);
                 }),
@@ -406,7 +412,11 @@ impl Render for ProbeApp {
             )
             .on_action(
                 cx.listener(|view, _: &CancelEnvironmentManagerDialog, window, cx| {
-                    view.request_close_environment_manager_dialog(window, cx);
+                    if view.secret_value_dialog.is_some() {
+                        view.close_secret_value_dialog(window, cx);
+                    } else {
+                        view.request_close_environment_manager_dialog(window, cx);
+                    }
                 }),
             )
             .on_action(
@@ -480,6 +490,7 @@ impl Render for ProbeApp {
             .child(self.render_structure_dialog(theme, window, cx))
             .child(self.render_save_folder_dialog(theme, window, cx))
             .child(self.render_environment_manager_dialog(theme, window, cx))
+            .child(self.render_secret_value_dialog(theme, window, cx))
             .child(self.render_environment_manager_context_menu(theme, window, cx))
             .child(self.render_create_environment_dialog(theme, window, cx))
             .child(self.render_application_dialog(theme, window, cx))

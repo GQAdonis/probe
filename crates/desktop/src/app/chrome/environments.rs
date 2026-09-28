@@ -1,5 +1,7 @@
 use super::*;
 
+const ENABLED_COLUMN_WIDTH: f32 = 44.0;
+
 impl ProbeApp {
     pub(super) fn render_environment_manager_sidebar(
         theme: Theme,
@@ -155,6 +157,414 @@ impl ProbeApp {
             .child(environment_list)
     }
 
+    fn render_environment_variable_row(
+        &self,
+        theme: Theme,
+        dialog: &EnvironmentManagerDialog,
+        row: probe_core::EffectiveEnvironmentVariable,
+        busy: bool,
+        dirty: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let row_index = row.direct_index.unwrap_or(0);
+        let row_id = match row.direct_index {
+            Some(direct_index) => format!(
+                "direct-{}-{}",
+                dialog.original_name,
+                dialog
+                    .variable_row_ids
+                    .get(direct_index)
+                    .copied()
+                    .unwrap_or(direct_index as u64)
+            ),
+            None => format!(
+                "inherited-{}-{}-{}",
+                dialog.original_name,
+                row.defined_in,
+                match &row.variable {
+                    EnvironmentVariable::Plain(variable) => variable.name.as_deref().unwrap_or(""),
+                    EnvironmentVariable::Secret(variable) => variable.name.as_deref().unwrap_or(""),
+                }
+            ),
+        };
+        let (value, editable) = match &row.variable {
+            EnvironmentVariable::Plain(variable) => environment_variable_text(variable),
+            EnvironmentVariable::Secret(_) => (String::new(), false),
+        };
+        let secret = matches!(row.variable, EnvironmentVariable::Secret(_));
+        let direct_index = row.direct_index;
+        let inherited = direct_index.is_none();
+        let toggle_variable = row.variable.clone();
+        let value_variable = row.variable.clone();
+        let toggle_view = cx.weak_entity();
+        let value_view = cx.weak_entity();
+        let remove_view = cx.weak_entity();
+        let variable_name_view = cx.weak_entity();
+        let name = match &row.variable {
+            EnvironmentVariable::Plain(variable) => variable.name.clone(),
+            EnvironmentVariable::Secret(variable) => variable.name.clone(),
+        }
+        .unwrap_or_default();
+        let enabled = match &row.variable {
+            EnvironmentVariable::Plain(variable) => !variable.disabled,
+            EnvironmentVariable::Secret(variable) => !variable.disabled,
+        };
+        let value_selector = if name.is_empty() {
+            format!("environment-variable-value-{row_index}")
+        } else {
+            format!("environment-variable-value-{name}")
+        };
+        let mut row_element = div()
+            .id(format!("environment-manager-variable-row-{row_id}"))
+            .w_full()
+            .h(px(theme.metrics.control_height + theme.metrics.spacing_2))
+            .flex_none()
+            .overflow_hidden()
+            .px(px(theme.metrics.spacing_2))
+            .flex()
+            .items_center()
+            .gap(px(theme.metrics.spacing_2))
+            .border_b_1()
+            .border_color(theme.colors.borders.subtle)
+            .when(inherited, |row| row.text_color(theme.colors.text.muted))
+            .child(div().w(px(ENABLED_COLUMN_WIDTH)).child(components::switch(
+                theme,
+                format!("environment-variable-enabled-{row_id}"),
+                format!("Enable {name}"),
+                enabled,
+                busy,
+                move |enabled, _, cx| {
+                    let mut variable = toggle_variable.clone();
+                    match &mut variable {
+                        EnvironmentVariable::Plain(variable) => variable.disabled = !enabled,
+                        EnvironmentVariable::Secret(variable) => variable.disabled = !enabled,
+                    }
+                    let _ = toggle_view.update(cx, |view, cx| {
+                        view.apply_environment_manager_draft(cx, |dialog| {
+                            if let Some(index) = direct_index {
+                                dialog.draft.variables[index] = variable;
+                            } else {
+                                dialog.add_variable(variable);
+                            }
+                        });
+                    });
+                },
+            )))
+            .child(
+                div()
+                    .id(format!("environment-variable-type-{row_id}"))
+                    .debug_selector({
+                        let selector = format!("environment-variable-type-{name}");
+                        move || selector.clone()
+                    })
+                    .w(px(theme.metrics.icon_standard))
+                    .flex_none()
+                    .when(secret, |slot| slot.child(components::lock_icon(theme))),
+            )
+            .child(if inherited {
+                div()
+                    .w(px(155.0))
+                    .flex_none()
+                    .min_w(px(0.0))
+                    .flex()
+                    .items_center()
+                    .child(
+                        components::truncated_label(name.clone())
+                            .min_w(px(0.0))
+                            .font_family(theme.typography.monospace_family)
+                            .text_color(theme.colors.text.muted),
+                    )
+                    .into_any_element()
+            } else {
+                let name_selector = if name.is_empty() {
+                    format!("environment-variable-name-{row_index}")
+                } else {
+                    format!("environment-variable-name-{name}")
+                };
+                div()
+                    .id(format!("environment-variable-name-{row_id}"))
+                    .debug_selector({
+                        let selector = name_selector.clone();
+                        move || selector
+                    })
+                    .w(px(155.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div().flex_1().min_w(px(0.0)).child(
+                            components::dialog_text_input(
+                                theme,
+                                format!("environment-variable-name-input-{row_id}"),
+                                name.clone(),
+                                "Name",
+                                name.is_empty() && !busy,
+                                move |value, _, cx| {
+                                    let _ = variable_name_view.update(cx, |view, cx| {
+                                        view.apply_environment_manager_draft(cx, |dialog| {
+                                            if let Some(index) = direct_index {
+                                                match dialog.draft.variables.get_mut(index) {
+                                                    Some(EnvironmentVariable::Plain(variable)) => {
+                                                        variable.name = Some(value.to_string())
+                                                    }
+                                                    Some(EnvironmentVariable::Secret(variable)) => {
+                                                        variable.name = Some(value.to_string())
+                                                    }
+                                                    None => {}
+                                                }
+                                            }
+                                        });
+                                    });
+                                },
+                                |_, _, _| {},
+                            )
+                            .disabled(busy),
+                        ),
+                    )
+                    .into_any_element()
+            })
+            .child(if editable {
+                let input_id = format!("environment-variable-value-input-{row_id}");
+                div()
+                    .id(value_selector.clone())
+                    .debug_selector({
+                        let selector = value_selector.clone();
+                        move || selector
+                    })
+                    .flex_1()
+                    .min_w(px(120.0))
+                    .child(
+                        components::dialog_text_input(
+                            theme,
+                            input_id,
+                            value,
+                            "Value",
+                            false,
+                            move |value, _, cx| {
+                                let EnvironmentVariable::Plain(mut variable) =
+                                    value_variable.clone()
+                                else {
+                                    return;
+                                };
+                                set_environment_variable_text(&mut variable, value.to_string());
+                                let _ = value_view.update(cx, |view, cx| {
+                                    view.apply_environment_manager_draft(cx, |dialog| {
+                                        if let Some(index) = direct_index {
+                                            dialog.draft.variables[index] =
+                                                EnvironmentVariable::Plain(variable);
+                                        } else {
+                                            dialog
+                                                .add_variable(EnvironmentVariable::Plain(variable));
+                                        }
+                                    });
+                                });
+                            },
+                            |_, _, _| {},
+                        )
+                        .disabled(busy),
+                    )
+                    .into_any_element()
+            } else if secret {
+                self.render_secret_variable_value_cell(theme, dialog, name.clone(), busy, dirty, cx)
+            } else {
+                environment_variant_value(theme, &name, row_index, value, inherited)
+            })
+            .child(
+                div()
+                    .id(format!("environment-variable-defined-in-{row_id}"))
+                    .debug_selector({
+                        let selector = format!("environment-variable-defined-in-{name}");
+                        move || selector.clone()
+                    })
+                    .w(px(140.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        components::truncated_label(row.defined_in.clone())
+                            .text_size(px(theme.typography.caption_size))
+                            .text_color(theme.colors.text.muted),
+                    )
+                    .when(secret && inherited, |cell| {
+                        cell.child(
+                            components::truncated_label(format!("Value for {}", dialog.draft.name))
+                                .text_size(px(theme.typography.caption_size))
+                                .text_color(theme.colors.text.muted),
+                        )
+                    }),
+            );
+        row_element = if let Some(index) = direct_index {
+            row_element.child(
+                components::remove_row_button(
+                    theme,
+                    format!("environment-variable-delete-{row_id}"),
+                    format!("Remove {name} from this environment"),
+                    move |_, _, cx| {
+                        let _ = remove_view.update(cx, |view, cx| {
+                            view.apply_environment_manager_draft(cx, |dialog| {
+                                dialog.remove_variable(index);
+                            });
+                        });
+                    },
+                )
+                .disabled(busy),
+            )
+        } else {
+            row_element.child(div().w(px(32.0)))
+        };
+        row_element.into_any_element()
+    }
+
+    fn render_secret_variable_value_cell(
+        &self,
+        theme: Theme,
+        dialog: &EnvironmentManagerDialog,
+        name: String,
+        busy: bool,
+        dirty: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let credential_ready = !dirty && !busy && !name.is_empty();
+        let current_status = dialog.secret_statuses.get(&name).copied();
+        let status = if dirty {
+            "Save changes to manage secret"
+        } else if busy {
+            "Saving changes…"
+        } else {
+            match current_status.unwrap_or(SecretUiStatus::Unknown) {
+                SecretUiStatus::Loading => "Removing stored secret…",
+                SecretUiStatus::Stored => "● Stored securely",
+                SecretUiStatus::NotStored => "○ Not set",
+                SecretUiStatus::Unknown => "Not verified",
+            }
+        };
+        let actionable = credential_ready && !self.secret_write_in_progress;
+        let set_view = cx.weak_entity();
+        let set_name = name.clone();
+        let button_label = match current_status {
+            Some(SecretUiStatus::Stored) => "Replace",
+            _ => "Set",
+        };
+        let set_selector = match current_status {
+            Some(SecretUiStatus::Stored) => {
+                format!("environment-secret-replace-{name}")
+            }
+            _ => format!("environment-secret-set-{name}"),
+        };
+        div()
+            .id(format!("environment-secret-status-{name}"))
+            .debug_selector({
+                let selector = format!("environment-secret-status-{name}");
+                move || selector.clone()
+            })
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .items_center()
+            .gap(px(theme.metrics.spacing_2))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(theme.typography.caption_size))
+                    .text_color(match current_status {
+                        Some(SecretUiStatus::Stored) if credential_ready => {
+                            theme.colors.status.success
+                        }
+                        _ => theme.colors.text.muted,
+                    })
+                    .child(status),
+            )
+            .when(
+                credential_ready
+                    && matches!(
+                        current_status,
+                        Some(
+                            SecretUiStatus::Stored
+                                | SecretUiStatus::NotStored
+                                | SecretUiStatus::Unknown
+                        )
+                    ),
+                |row| {
+                    row.child(
+                        components::editor_action_button(
+                            theme,
+                            set_selector,
+                            button_label,
+                            !actionable,
+                            move |_, window, cx| {
+                                let _ = set_view.update(cx, |view, cx| {
+                                    view.open_secret_value_dialog(set_name.clone(), window, cx);
+                                });
+                            },
+                        )
+                        .flex_none(),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    fn render_environment_variable_add_row(
+        &self,
+        theme: Theme,
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let add_variable_view = cx.weak_entity();
+        let add_secret_view = cx.weak_entity();
+        div()
+            .w_full()
+            .h(px(theme.metrics.control_height + theme.metrics.spacing_2))
+            .px(px(theme.metrics.spacing_2))
+            .py(px(theme.metrics.spacing_1))
+            .flex()
+            .gap(px(theme.metrics.spacing_2))
+            .child(
+                components::editor_add_button(
+                    theme,
+                    "environment-manager-add-variable",
+                    "Add variable",
+                    move |_, _, cx| {
+                        let _ = add_variable_view.update(cx, |view, cx| {
+                            view.apply_environment_manager_draft(cx, |dialog| {
+                                dialog.add_variable(EnvironmentVariable::Plain(Variable {
+                                    name: Some(String::new()),
+                                    value: Some(VariableValueSet::Single(VariableValue::String(
+                                        String::new(),
+                                    ))),
+                                    disabled: false,
+                                }));
+                            });
+                        });
+                    },
+                )
+                .disabled(busy),
+            )
+            .child(
+                components::editor_add_button(
+                    theme,
+                    "environment-manager-add-secret",
+                    "Add secret variable",
+                    move |_, _, cx| {
+                        let _ = add_secret_view.update(cx, |view, cx| {
+                            view.apply_environment_manager_draft(cx, |dialog| {
+                                dialog.add_variable(EnvironmentVariable::Secret(SecretVariable {
+                                    name: Some(String::new()),
+                                    value_type: None,
+                                    disabled: false,
+                                }));
+                            });
+                        });
+                    },
+                )
+                .disabled(busy),
+            )
+            .into_any_element()
+    }
+
     pub(in crate::app) fn render_environment_manager_dialog(
         &self,
         theme: Theme,
@@ -209,225 +619,69 @@ impl ProbeApp {
             .text_size(px(theme.typography.caption_size))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme.colors.text.muted)
-            .child(div().w(px(68.0)).child("ENABLED"))
+            .child(div().w(px(ENABLED_COLUMN_WIDTH)).child("ON"))
+            .child(div().w(px(theme.metrics.icon_standard)))
             .child(div().w(px(155.0)).child("NAME"))
             .child(div().flex_1().child("VALUE"))
             .child(div().w(px(140.0)).child("DEFINED IN"))
             .child(div().w(px(32.0)));
-        let mut table_body = div()
+        let table_body = div()
             .id("environment-manager-variables")
             .debug_selector(|| "environment-manager-variables".into())
             .flex_1()
             .min_h(px(0.0))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col();
-        if rows_empty {
-            table_body = table_body.child(
-                div()
-                    .min_h(px(theme.metrics.control_height + theme.metrics.spacing_2))
-                    .px(px(theme.metrics.spacing_2))
-                    .flex()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(theme.colors.borders.subtle)
-                    .text_color(theme.colors.text.muted)
-                    .child("No variables in this environment."),
-            );
-        }
-        for (row_index, row) in rows.into_iter().enumerate() {
-            let (value, editable) = environment_variable_text(&row.variable);
-            let direct_index = row.direct_index;
-            let inherited = direct_index.is_none();
-            let toggle_variable = row.variable.clone();
-            let value_variable = row.variable.clone();
-            let toggle_view = cx.weak_entity();
-            let value_view = cx.weak_entity();
-            let remove_view = cx.weak_entity();
-            let variable_name_view = cx.weak_entity();
-            let name = row.variable.name.clone().unwrap_or_default();
-            let value_selector = if name.is_empty() {
-                format!("environment-variable-value-{row_index}")
-            } else {
-                format!("environment-variable-value-{name}")
-            };
-            let mut row_element = div()
-                .id(("environment-manager-variable-row", row_index))
-                .min_h(px(theme.metrics.control_height + theme.metrics.spacing_2))
-                .px(px(theme.metrics.spacing_2))
-                .flex()
-                .items_center()
-                .gap(px(theme.metrics.spacing_2))
-                .border_b_1()
-                .border_color(theme.colors.borders.subtle)
-                .when(inherited, |row| row.text_color(theme.colors.text.muted))
-                .child(div().w(px(68.0)).child(components::switch(
-                    theme,
-                    ("environment-variable-enabled", row_index),
-                    format!("Enable {name}"),
-                    !row.variable.disabled,
-                    busy,
-                    move |enabled, _, cx| {
-                        let mut variable = toggle_variable.clone();
-                        variable.disabled = !enabled;
-                        let _ = toggle_view.update(cx, |view, cx| {
-                            view.apply_environment_manager_draft(cx, |dialog| {
-                                if let Some(index) = direct_index {
-                                    dialog.draft.variables[index] =
-                                        EnvironmentVariable::Plain(variable);
-                                } else {
-                                    dialog
-                                        .draft
-                                        .variables
-                                        .push(EnvironmentVariable::Plain(variable));
-                                }
-                            });
-                        });
-                    },
-                )))
-                .child(if inherited {
-                    components::truncated_label(name.clone())
-                        .w(px(155.0))
-                        .font_family(theme.typography.monospace_family)
-                        .text_color(theme.colors.text.muted)
-                        .into_any_element()
-                } else {
-                    let name_selector = if name.is_empty() {
-                        format!("environment-variable-name-{row_index}")
-                    } else {
-                        format!("environment-variable-name-{name}")
-                    };
-                    div()
-                        .id(("environment-variable-name", row_index))
-                        .debug_selector({
-                            let selector = name_selector.clone();
-                            move || selector
-                        })
-                        .w(px(155.0))
-                        .child(
-                            components::dialog_text_input(
-                                theme,
-                                format!("environment-variable-name-input-{row_index}"),
-                                name.clone(),
-                                "Name",
-                                name.is_empty() && !busy,
-                                move |value, _, cx| {
-                                    let _ = variable_name_view.update(cx, |view, cx| {
-                                        view.apply_environment_manager_draft(cx, |dialog| {
-                                            if let Some(index) = direct_index
-                                                && let Some(EnvironmentVariable::Plain(variable)) =
-                                                    dialog.draft.variables.get_mut(index)
-                                            {
-                                                variable.name = Some(value.to_string());
-                                            }
-                                        });
-                                    });
-                                },
-                                |_, _, _| {},
-                            )
-                            .disabled(busy),
+            .relative();
+        let row_count = rows.len() + 1 + usize::from(rows_empty);
+        let rows = Rc::new(rows);
+        let list = uniform_list("environment-manager-variable-list", row_count, {
+            let rows = rows.clone();
+            cx.processor(move |view, range: std::ops::Range<usize>, _, cx| {
+                #[cfg(test)]
+                {
+                    view.rendered_environment_variable_rows =
+                        range.clone().filter(|index| *index < rows.len()).count();
+                }
+                let Some(dialog) = view.environment_manager_dialog.as_ref() else {
+                    return Vec::new();
+                };
+                range
+                    .filter_map(|index| {
+                        if rows_empty && index == 0 {
+                            return Some(
+                                div()
+                                    .w_full()
+                                    .h(px(theme.metrics.control_height + theme.metrics.spacing_2))
+                                    .px(px(theme.metrics.spacing_2))
+                                    .flex()
+                                    .items_center()
+                                    .border_b_1()
+                                    .border_color(theme.colors.borders.subtle)
+                                    .text_color(theme.colors.text.muted)
+                                    .child("No variables in this environment.")
+                                    .into_any_element(),
+                            );
+                        }
+                        if index == row_count - 1 {
+                            return Some(view.render_environment_variable_add_row(theme, busy, cx));
+                        }
+                        let row = rows.get(index)?.clone();
+                        Some(
+                            view.render_environment_variable_row(
+                                theme, dialog, row, busy, dirty, cx,
+                            ),
                         )
-                        .into_any_element()
-                })
-                .child(if editable {
-                    let input_id = format!("{value_selector}-input");
-                    div()
-                        .id(value_selector.clone())
-                        .debug_selector({
-                            let selector = value_selector.clone();
-                            move || selector
-                        })
-                        .flex_1()
-                        .min_w(px(120.0))
-                        .child(
-                            components::dialog_text_input(
-                                theme,
-                                input_id,
-                                value,
-                                "Value",
-                                false,
-                                move |value, _, cx| {
-                                    let mut variable = value_variable.clone();
-                                    set_environment_variable_text(&mut variable, value.to_string());
-                                    let _ = value_view.update(cx, |view, cx| {
-                                        view.apply_environment_manager_draft(cx, |dialog| {
-                                            if let Some(index) = direct_index {
-                                                dialog.draft.variables[index] =
-                                                    EnvironmentVariable::Plain(variable);
-                                            } else {
-                                                dialog
-                                                    .draft
-                                                    .variables
-                                                    .push(EnvironmentVariable::Plain(variable));
-                                            }
-                                        });
-                                    });
-                                },
-                                |_, _, _| {},
-                            )
-                            .disabled(busy),
-                        )
-                        .into_any_element()
-                } else {
-                    environment_variant_value(theme, &name, row_index, value, inherited)
-                })
-                .child(
-                    components::truncated_label(row.defined_in)
-                        .w(px(140.0))
-                        .text_size(px(theme.typography.caption_size))
-                        .text_color(theme.colors.text.muted),
-                );
-            row_element = if let Some(index) = direct_index {
-                row_element.child(
-                    components::remove_row_button(
-                        theme,
-                        ("environment-variable-delete", row_index),
-                        format!("Delete {name}"),
-                        move |_, _, cx| {
-                            let _ = remove_view.update(cx, |view, cx| {
-                                view.apply_environment_manager_draft(cx, |dialog| {
-                                    if index < dialog.draft.variables.len() {
-                                        dialog.draft.variables.remove(index);
-                                    }
-                                });
-                            });
-                        },
-                    )
-                    .disabled(busy),
-                )
-            } else {
-                row_element.child(div().w(px(32.0)))
-            };
-            table_body = table_body.child(row_element);
-        }
-
-        let add_variable_view = cx.weak_entity();
-        table_body = table_body.child(
-            div().p(px(theme.metrics.spacing_2)).child(
-                components::editor_add_button(
-                    theme,
-                    "environment-manager-add-variable",
-                    "Add variable",
-                    move |_, _, cx| {
-                        let _ = add_variable_view.update(cx, |view, cx| {
-                            view.apply_environment_manager_draft(cx, |dialog| {
-                                dialog
-                                    .draft
-                                    .variables
-                                    .push(EnvironmentVariable::Plain(Variable {
-                                        name: Some(String::new()),
-                                        value: Some(VariableValueSet::Single(
-                                            VariableValue::String(String::new()),
-                                        )),
-                                        disabled: false,
-                                    }));
-                            });
-                        });
-                    },
-                )
-                .disabled(busy),
-            ),
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .size_full()
+        .track_scroll(&self.environment_variables_scroll);
+        let table_body = table_body.child(list).child(
+            Scrollbar::vertical(&self.environment_variables_scroll)
+                .id("environment-manager-variables-scrollbar")
+                .mode(ScrollbarMode::Scrolling),
         );
+
         let table = div()
             .mt(px(theme.metrics.spacing_2))
             .flex_1()
@@ -624,5 +878,89 @@ impl ProbeApp {
         )
         .with_priority(POPUP_PRIORITY)
         .into_any_element()
+    }
+
+    pub(in crate::app) fn render_secret_value_dialog(
+        &self,
+        theme: Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(dialog) = &self.secret_value_dialog else {
+            return div().into_any_element();
+        };
+        let cancel_view = cx.weak_entity();
+        let save_view = cx.weak_entity();
+        let delete_view = cx.weak_entity();
+        let delete_name = dialog.target.name.clone();
+        let input = dialog.input.clone();
+        let stored = self.secret_is_stored(&dialog.target, dialog.from_manager);
+        let content = components::dialog_surface(theme, "secret-value-dialog", components::COMPACT_DIALOG_WIDTH)
+            .debug_selector(|| "secret-value-dialog".into())
+            .child(components::dialog_title(theme, if dialog.replacing { "Replace secret" } else { "Set secret" }))
+            .child(div()
+                .id("secret-value-identity")
+                .debug_selector(|| "secret-value-identity".into())
+                .mt(px(theme.metrics.spacing_2))
+                .w_full()
+                .min_w(px(0.0))
+                .px(px(theme.metrics.spacing_2))
+                .py(px(theme.metrics.spacing_2))
+                .flex()
+                .items_center()
+                .gap(px(theme.metrics.spacing_2))
+                .rounded(px(theme.metrics.radius_small))
+                .border_1()
+                .border_color(theme.colors.borders.subtle)
+                .bg(theme.colors.surfaces.raised)
+                .child(components::lock_icon(theme).flex_none())
+                .child(components::truncated_label(dialog.target.name.clone())
+                    .font_family(theme.typography.monospace_family)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.colors.text.primary))
+                .child(div()
+                    .flex_none()
+                    .text_color(theme.colors.text.muted)
+                    .child("in"))
+                .child(components::truncated_label(dialog.target.environment.clone())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.colors.actions.accent)))
+            .child(div().mt(px(theme.metrics.spacing_3)).child(components::dialog_field_label(theme, "Secret value")))
+            .child(div()
+                .id("secret-value-input")
+                .debug_selector(|| "secret-value-input".into())
+                .mt(px(theme.metrics.spacing_1))
+                .h(px(theme.metrics.control_height))
+                .px(px(theme.metrics.spacing_2))
+                .flex()
+                .items_center()
+                .rounded(px(theme.metrics.radius_small))
+                .border_1()
+                .border_color(theme.colors.borders.standard)
+                .bg(theme.colors.surfaces.raised)
+                .cursor_text()
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                })
+                .child(Input::new(&dialog.input)))
+            .child(components::dialog_description(theme, "Stored in your system credential store. The value is never saved to this collection or displayed by Probe.")
+                .mt(px(theme.metrics.spacing_2)))
+            .when_some(dialog.error, |content, error| content.child(
+                components::dialog_description(theme, error).mt(px(theme.metrics.spacing_2)).text_color(theme.colors.status.error)
+            ))
+            .child(components::dialog_actions(theme)
+                .when(dialog.replacing && stored, |actions| actions.child(
+                    components::dialog_action_button(theme, "secret-value-delete-stored", "Delete Stored Value", components::DialogActionStyle::Destructive, None, dialog.busy || self.secret_write_in_progress, move |_, window, cx| {
+                        let _ = delete_view.update(cx, |view, cx| view.confirm_delete_stored_secret(delete_name.clone(), window, cx));
+                    })
+                ))
+                .child(components::dialog_action_button(theme, "secret-value-cancel", "Cancel", components::DialogActionStyle::Secondary, None, false, move |_, window, cx| {
+                    let _ = cancel_view.update(cx, |view, cx| view.close_secret_value_dialog(window, cx));
+                }))
+                .child(components::dialog_action_button(theme, "secret-value-save", if dialog.busy { "Saving…" } else { "Save Secret" }, components::DialogActionStyle::Primary, components::shortcut_label_for_action_in_context(window, &SubmitSecretValueDialog, "SecretValueDialog"), dialog.busy || dialog.input.read(cx).value().is_empty(), move |_, window, cx| {
+                    let _ = save_view.update(cx, |view, cx| view.save_secret_value(window, cx));
+                })));
+        components::dialog_layer(theme, &dialog.restore_focus, "SecretValueDialog", content)
+            .into_any_element()
     }
 }

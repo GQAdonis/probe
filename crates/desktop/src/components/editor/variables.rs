@@ -107,7 +107,14 @@ pub(in crate::components) fn variable_input_overlay(
             .child(hits),
     );
 
-    with_variable_tooltip(wrapper, theme, hover, variables, cx)
+    with_variable_tooltip(
+        wrapper,
+        theme,
+        hover,
+        variables,
+        state.read(cx).focus_handle(cx),
+        cx,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -188,7 +195,14 @@ pub(super) fn variable_editor_overlay(
         window.request_animation_frame();
     }
     wrapper = wrapper.child(hits);
-    with_variable_tooltip(wrapper, theme, hover, variables, cx)
+    with_variable_tooltip(
+        wrapper,
+        theme,
+        hover,
+        variables,
+        state.read(cx).focus_handle(cx),
+        cx,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -247,6 +261,7 @@ fn with_variable_tooltip(
     theme: Theme,
     hover: Entity<VariableHoverState>,
     variables: VariableContext,
+    editor_focus: FocusHandle,
     cx: &App,
 ) -> gpui::AnyElement {
     let (open, active, bounds) = {
@@ -279,7 +294,8 @@ fn with_variable_tooltip(
                         presentation,
                         hover,
                         value_input,
-                        variables.on_manage_environments,
+                        variables,
+                        editor_focus,
                     )),
             )
             .with_priority(POPUP_PRIORITY + 1),
@@ -446,7 +462,7 @@ impl Element for VariableHighlightElement {
         let variables = &self.variables;
         let runs =
             variable_highlight_runs(&value, &references, &run, self.palette, |kind, name| {
-                reference_status(variables, kind, name)
+                placeholder_tone(variables, kind, name)
             });
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line = window
@@ -515,7 +531,7 @@ pub(in crate::components) fn variable_highlight_runs(
     references: &[VariableReference],
     base: &TextRun,
     palette: VariableHighlightPalette,
-    mut status_for: impl FnMut(ReferenceKind, &str) -> VariableStatus,
+    mut tone_for: impl FnMut(ReferenceKind, &str) -> PlaceholderTone,
 ) -> Vec<TextRun> {
     let mut runs = Vec::new();
     let mut ix = 0;
@@ -536,7 +552,7 @@ pub(in crate::components) fn variable_highlight_runs(
             continue;
         }
         let (color, underline) =
-            placeholder_paint(status_for(reference.kind, reference.name(value)), palette);
+            placeholder_paint(tone_for(reference.kind, reference.name(value)), palette);
         runs.push(TextRun {
             len: end - start,
             color,
@@ -604,7 +620,13 @@ pub(in crate::components) fn variable_tooltip_presentation(
     name: &str,
     variables: &VariableContext,
 ) -> VariableTooltipPresentation {
+    if variables.unknown_secrets.contains(name) {
+        return VariableTooltipPresentation::secret(SecretTooltipState::Unknown);
+    }
     match variables.status(name) {
+        VariableStatus::Resolved if variables.resolved_secrets.contains(name) => {
+            VariableTooltipPresentation::secret(SecretTooltipState::Stored)
+        }
         VariableStatus::Resolved => VariableTooltipPresentation {
             value: variables
                 .values
@@ -614,18 +636,17 @@ pub(in crate::components) fn variable_tooltip_presentation(
             placeholder: "Variable value",
             editable: variables.on_change.is_some(),
             hint: None,
+            secret: None,
         },
-        VariableStatus::SecretWithoutValue => VariableTooltipPresentation {
-            value: variables.unavailable_message.clone(),
-            placeholder: "Variable value",
-            editable: false,
-            hint: Some("Secret has no value in this environment"),
-        },
+        VariableStatus::SecretWithoutValue => {
+            VariableTooltipPresentation::secret(SecretTooltipState::NotStored)
+        }
         VariableStatus::Missing if variables.on_change.is_some() => VariableTooltipPresentation {
             value: String::new(),
             placeholder: "Enter a value to create",
             editable: true,
             hint: Some("Not defined in this environment"),
+            secret: None,
         },
         VariableStatus::Missing => unavailable_variable_tooltip(&variables.unavailable_message),
     }
@@ -637,6 +658,7 @@ fn unavailable_variable_tooltip(message: &str) -> VariableTooltipPresentation {
         placeholder: "Variable value",
         editable: false,
         hint: None,
+        secret: None,
     }
 }
 
@@ -645,6 +667,50 @@ pub(in crate::components) struct VariableTooltipPresentation {
     pub(in crate::components) placeholder: &'static str,
     pub(in crate::components) editable: bool,
     pub(in crate::components) hint: Option<&'static str>,
+    pub(in crate::components) secret: Option<SecretTooltipState>,
+}
+
+impl VariableTooltipPresentation {
+    fn secret(state: SecretTooltipState) -> Self {
+        Self {
+            value: String::new(),
+            placeholder: "Secret value",
+            editable: false,
+            hint: None,
+            secret: Some(state),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::components) enum SecretTooltipState {
+    Stored,
+    NotStored,
+    Unknown,
+}
+
+impl SecretTooltipState {
+    pub(in crate::components) fn status_text(self) -> &'static str {
+        match self {
+            Self::Stored => "● Stored securely",
+            Self::NotStored => "○ Not set",
+            Self::Unknown => "Not verified",
+        }
+    }
+
+    pub(in crate::components) fn status_color(self, theme: Theme) -> gpui::Rgba {
+        match self {
+            Self::Stored => theme.colors.status.success,
+            Self::NotStored | Self::Unknown => theme.colors.text.muted,
+        }
+    }
+
+    pub(in crate::components) fn action_label(self) -> &'static str {
+        match self {
+            Self::Stored => "Replace Secret…",
+            Self::NotStored | Self::Unknown => "Set Secret…",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -672,12 +738,14 @@ impl VariableReference {
 pub(in crate::components) struct VariableHighlightPalette {
     pub(in crate::components) resolved: Hsla,
     pub(in crate::components) unresolved: Hsla,
+    pub(in crate::components) neutral: Hsla,
 }
 
 pub(in crate::components) fn variable_highlight_palette(theme: Theme) -> VariableHighlightPalette {
     VariableHighlightPalette {
         resolved: theme.colors.syntax.string.into(),
         unresolved: theme.colors.status.error.into(),
+        neutral: theme.colors.text.secondary.into(),
     }
 }
 
@@ -692,21 +760,43 @@ pub(in crate::components) fn reference_status(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::components) enum PlaceholderTone {
+    Resolved,
+    Unresolved,
+    Neutral,
+}
+
+pub(in crate::components) fn placeholder_tone(
+    variables: &VariableContext,
+    kind: ReferenceKind,
+    name: &str,
+) -> PlaceholderTone {
+    if kind == ReferenceKind::Environment && variables.unknown_secrets.contains(name) {
+        return PlaceholderTone::Neutral;
+    }
+    if reference_status(variables, kind, name).is_resolved() {
+        PlaceholderTone::Resolved
+    } else {
+        PlaceholderTone::Unresolved
+    }
+}
+
 pub(in crate::components) fn placeholder_paint(
-    status: VariableStatus,
+    tone: PlaceholderTone,
     palette: VariableHighlightPalette,
 ) -> (Hsla, Option<UnderlineStyle>) {
-    if status.is_resolved() {
-        (palette.resolved, None)
-    } else {
-        (
+    match tone {
+        PlaceholderTone::Resolved => (palette.resolved, None),
+        PlaceholderTone::Neutral => (palette.neutral, None),
+        PlaceholderTone::Unresolved => (
             palette.unresolved,
             Some(UnderlineStyle {
                 thickness: px(1.0),
                 color: Some(palette.unresolved),
                 wavy: false,
             }),
-        )
+        ),
     }
 }
 
