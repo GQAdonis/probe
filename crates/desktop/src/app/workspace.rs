@@ -103,7 +103,7 @@ impl ProbeApp {
                 dirty,
                 PendingClose::Open {
                     path,
-                    restored_state,
+                    restored_state: restored_state.map(Box::new),
                 },
                 window,
                 cx,
@@ -113,7 +113,7 @@ impl ProbeApp {
         if self.has_pending_environment_work() {
             self.pending_close = Some(PendingClose::Open {
                 path,
-                restored_state,
+                restored_state: restored_state.map(Box::new),
             });
             self.start_next_environment_save(window, cx);
             return;
@@ -975,8 +975,11 @@ impl ProbeApp {
         self.remap_structure_dialog(&reconciled.selector_remaps);
         self.create_environment_dialog = None;
         self.sync_environment_manager_after_reload(environment_manager_reload, cx);
-        if self.environment_manager_dialog.is_some() && !self.environment_manager_is_dirty() {
-            self.refresh_secret_statuses(cx);
+        // A dirty draft name is not the stored credential's environment. Recomputing
+        // labels from it would mark a stored secret unknown, and reverting the name
+        // does not sync again.
+        if !self.environment_manager_is_dirty() {
+            self.sync_secret_statuses_from_presence();
         }
         if self.shell.selected_environment().is_some_and(|name| {
             !self

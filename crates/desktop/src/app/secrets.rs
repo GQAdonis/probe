@@ -1,5 +1,17 @@
+use std::{collections::BTreeMap, path::Path};
+
 use super::*;
-use crate::credentials::{CredentialId, CredentialStatus, CredentialStore, CredentialStoreError};
+use crate::credentials::{CredentialId, CredentialStore, CredentialStoreError};
+use crate::execution::SecretPresenceReconciliation;
+
+/// In-memory `CredentialId` keys for the secrets currently classified by the editor.
+/// Rebuilt when the workspace, environment, or secret names change. Never persisted.
+pub(super) struct EditorSecretIdentityCache {
+    workspace: PathBuf,
+    environment: String,
+    names: BTreeSet<String>,
+    keys: BTreeMap<String, String>,
+}
 
 pub(super) fn default_credential_store() -> Arc<dyn CredentialStore> {
     #[cfg(test)]
@@ -17,9 +29,6 @@ struct TestCredentialStore;
 
 #[cfg(test)]
 impl CredentialStore for TestCredentialStore {
-    fn status(&self, _: &CredentialId) -> Result<CredentialStatus, CredentialStoreError> {
-        Ok(CredentialStatus::NotStored)
-    }
     fn set(&self, _: &CredentialId, _: &str) -> Result<(), CredentialStoreError> {
         Err(CredentialStoreError::Unsupported)
     }
@@ -30,7 +39,7 @@ impl CredentialStore for TestCredentialStore {
         &self,
         _: &CredentialId,
     ) -> Result<Option<probe_core::SecretValue>, CredentialStoreError> {
-        panic!("status must not fetch a secret value")
+        panic!("presentation must not read credential values")
     }
 }
 
@@ -60,18 +69,16 @@ impl ProbeApp {
         })
     }
 
-    pub(super) fn refresh_secret_statuses(&mut self, cx: &mut Context<Self>) {
-        self.secret_status_task = None;
-        self.secret_status_generation = self.secret_status_generation.wrapping_add(1);
-        let generation = self.secret_status_generation;
-        let Some(dialog) = self.environment_manager_dialog.as_mut() else {
-            return;
-        };
-        dialog.secret_statuses.clear();
-        let Some(loaded) = &self.loaded_workspace else {
+    /// Fill Environment Manager labels from presence metadata. Does not touch the
+    /// native credential store.
+    pub(super) fn sync_secret_statuses_from_presence(&mut self) {
+        let Some(dialog) = &self.environment_manager_dialog else {
             return;
         };
         let Some(path) = self.workspace_path.clone() else {
+            return;
+        };
+        let Some(loaded) = &self.loaded_workspace else {
             return;
         };
         let environment = dialog.draft.name.clone();
@@ -84,46 +91,152 @@ impl ProbeApp {
                 EnvironmentVariable::Plain(_) => None,
             })
             .collect();
-        if names.is_empty() {
-            cx.notify();
+        let statuses = names
+            .into_iter()
+            .map(|name| {
+                let key = CredentialId::for_workspace(&path, &environment, &name)
+                    .ok()
+                    .map(|id| id.persistence_key().to_owned());
+                let status = match key.as_deref() {
+                    Some(key) if self.session.stored_credentials.contains(key) => {
+                        SecretUiStatus::Stored
+                    }
+                    Some(key) if self.session.missing_credentials.contains(key) => {
+                        SecretUiStatus::NotStored
+                    }
+                    _ => SecretUiStatus::Unknown,
+                };
+                (name, status)
+            })
+            .collect();
+        if let Some(dialog) = self.environment_manager_dialog.as_mut() {
+            dialog.secret_statuses = statuses;
+        }
+    }
+
+    pub(super) fn editor_secret_sets(
+        &self,
+        selected: &str,
+        secrets_without_values: &BTreeSet<String>,
+    ) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+        let Some(workspace) = &self.workspace_path else {
+            return (
+                BTreeSet::new(),
+                BTreeSet::new(),
+                secrets_without_values.clone(),
+            );
+        };
+        let keys = self.secret_persistence_keys(workspace, selected, secrets_without_values);
+        let mut missing = BTreeSet::new();
+        let mut resolved = BTreeSet::new();
+        let mut unknown = BTreeSet::new();
+        for name in secrets_without_values {
+            match keys.get(name) {
+                Some(key) if self.session.stored_credentials.contains(key) => {
+                    resolved.insert(name.clone());
+                }
+                Some(key) if self.session.missing_credentials.contains(key) => {
+                    missing.insert(name.clone());
+                }
+                _ => {
+                    unknown.insert(name.clone());
+                }
+            }
+        }
+        (missing, resolved, unknown)
+    }
+
+    fn secret_persistence_keys(
+        &self,
+        workspace: &Path,
+        environment: &str,
+        names: &BTreeSet<String>,
+    ) -> BTreeMap<String, String> {
+        let mut cache = self.editor_secret_identities.borrow_mut();
+        if let Some(cached) = cache.as_ref()
+            && cached.workspace == workspace
+            && cached.environment == environment
+            && &cached.names == names
+        {
+            return cached.keys.clone();
+        }
+        let keys = names
+            .iter()
+            .filter_map(|name| {
+                CredentialId::for_workspace(workspace, environment, name)
+                    .ok()
+                    .map(|id| (name.clone(), id.persistence_key().to_owned()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        *cache = Some(EditorSecretIdentityCache {
+            workspace: workspace.to_path_buf(),
+            environment: environment.to_owned(),
+            names: names.clone(),
+            keys: keys.clone(),
+        });
+        keys
+    }
+
+    fn remember_stored_credential(&mut self, id: &CredentialId, cx: &mut Context<Self>) {
+        let changed = self.record_credential_presence(id.persistence_key(), true);
+        self.note_credential_presence_changed();
+        if changed {
+            self.persist_session(cx);
+        }
+        self.sync_secret_statuses_from_presence();
+        cx.notify();
+    }
+
+    fn forget_stored_credential(&mut self, id: &CredentialId, cx: &mut Context<Self>) {
+        let changed = self.record_credential_presence(id.persistence_key(), false);
+        self.note_credential_presence_changed();
+        if changed {
+            self.persist_session(cx);
+        }
+        self.sync_secret_statuses_from_presence();
+        cx.notify();
+    }
+
+    /// Moves one opaque identity between the stored and known-missing sets.
+    ///
+    /// `stored` records a value Probe has learned is present. `false` records a
+    /// trusted absence. Returns whether either set changed.
+    fn record_credential_presence(&mut self, key: &str, stored: bool) -> bool {
+        if stored {
+            let inserted = self.session.stored_credentials.insert(key.to_owned());
+            let cleared = self.session.missing_credentials.remove(key);
+            inserted || cleared
+        } else {
+            let removed = self.session.stored_credentials.remove(key);
+            let recorded = self.session.missing_credentials.insert(key.to_owned());
+            removed || recorded
+        }
+    }
+
+    fn note_credential_presence_changed(&mut self) {
+        self.credential_presence_revision = self.credential_presence_revision.wrapping_add(1);
+    }
+
+    pub(super) fn apply_secret_presence_reconciliation(
+        &mut self,
+        reconciliation: SecretPresenceReconciliation,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if revision < self.credential_presence_revision {
             return;
         }
-        for name in &names {
-            dialog
-                .secret_statuses
-                .insert(name.clone(), SecretUiStatus::Loading);
+        let mut changed = false;
+        for id in reconciliation.missing {
+            changed |= self.record_credential_presence(&id, false);
         }
-        let store = Arc::clone(&self.credential_store);
-        self.secret_status_task = Some(cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    names
-                        .into_iter()
-                        .map(|name| {
-                            let status = CredentialId::for_workspace(&path, &environment, &name)
-                                .and_then(|id| store.status(&id));
-                            let status = match status {
-                                Ok(CredentialStatus::Stored) => SecretUiStatus::Stored,
-                                Ok(CredentialStatus::NotStored)
-                                | Err(CredentialStoreError::NotFound) => SecretUiStatus::NotStored,
-                                Err(_) => SecretUiStatus::Unavailable,
-                            };
-                            (name, status)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .await;
-            let _ = view.update(cx, |view, cx| {
-                if view.secret_status_generation != generation {
-                    return;
-                }
-                view.secret_status_task = None;
-                if let Some(dialog) = view.environment_manager_dialog.as_mut() {
-                    dialog.secret_statuses = result.into_iter().collect();
-                    cx.notify();
-                }
-            });
-        }));
+        for id in reconciliation.found {
+            changed |= self.record_credential_presence(&id, true);
+        }
+        if changed {
+            self.persist_session(cx);
+            self.sync_secret_statuses_from_presence();
+        }
         cx.notify();
     }
 
@@ -213,55 +326,40 @@ impl ProbeApp {
         dialog
             .input
             .update(cx, |input, cx| input.set_value("", window, cx));
-        let workspace_path = path.clone();
         cx.spawn_in(window, async move |view, window| {
             let lookup_name = name.clone();
             let lookup_environment = environment.clone();
-            let result = window
+            let result: Result<CredentialId, CredentialStoreError> = window
                 .background_spawn(async move {
-                    CredentialId::for_workspace(&path, &lookup_environment, &lookup_name)
-                        .and_then(|id| store.set(&id, &value))
+                    let id = CredentialId::for_workspace(&path, &lookup_environment, &lookup_name)?;
+                    store.set(&id, &value)?;
+                    Ok(id)
                 })
                 .await;
-            let _ =
-                view.update_in(window, |view, window, cx| {
-                    view.secret_write_in_progress = false;
-                    // Status generation only drops stale status queries. A finished write
-                    // still completes when this workspace, environment, and secret are current.
-                    let same_context = view.workspace_path.as_ref() == Some(&workspace_path)
-                        && view
-                            .environment_manager_dialog
-                            .as_ref()
-                            .is_some_and(|dialog| dialog.draft.name == environment)
-                        && view.can_manage_secret(&name);
-                    if !same_context {
-                        if let Some(dialog) = view.secret_value_dialog.as_mut()
-                            && dialog.name == name
-                            && dialog.environment == environment
-                        {
-                            dialog.busy = false;
-                            cx.notify();
-                        }
-                        return;
+            let _ = view.update_in(window, |view, window, cx| {
+                view.secret_write_in_progress = false;
+                // Presence follows the completed write. Dialog lifetime must not
+                // decide whether the editor learns that the credential is stored.
+                if let Ok(id) = &result {
+                    view.remember_stored_credential(id, cx);
+                }
+                let dialog_matches = view
+                    .secret_value_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.name == name && dialog.environment == environment);
+                if result.is_err() {
+                    if dialog_matches {
+                        let dialog = view.secret_value_dialog.as_mut().unwrap();
+                        dialog.busy = false;
+                        dialog.error = Some("Could not save to the system credential store.");
+                        cx.notify();
                     }
-                    if result.is_err() {
-                        if let Some(dialog) = view.secret_value_dialog.as_mut()
-                            && dialog.name == name
-                            && dialog.environment == environment
-                        {
-                            dialog.busy = false;
-                            dialog.error = Some("Could not save to the system credential store.");
-                            cx.notify();
-                        }
-                        return;
-                    }
-                    if view.secret_value_dialog.as_ref().is_some_and(|dialog| {
-                        dialog.name == name && dialog.environment == environment
-                    }) {
-                        view.close_secret_value_dialog(window, cx);
-                    }
-                    view.refresh_secret_statuses(cx);
-                });
+                    return;
+                }
+                if dialog_matches {
+                    view.close_secret_value_dialog(window, cx);
+                }
+            });
         })
         .detach();
         cx.notify();
@@ -325,38 +423,43 @@ impl ProbeApp {
         };
         self.close_secret_value_dialog(window, cx);
         self.secret_write_in_progress = true;
-        let store = Arc::clone(&self.credential_store);
         if let Some(dialog) = self.environment_manager_dialog.as_mut() {
             dialog
                 .secret_statuses
                 .insert(name.clone(), SecretUiStatus::Loading);
         }
+        let store = Arc::clone(&self.credential_store);
         cx.spawn_in(window, async move |view, window| {
             let lookup_name = name.clone();
             let lookup_environment = environment.clone();
-            let result = window
+            let result: Result<CredentialId, CredentialStoreError> = window
                 .background_spawn(async move {
-                    CredentialId::for_workspace(&path, &lookup_environment, &lookup_name)
-                        .and_then(|id| store.delete(&id))
+                    let id = CredentialId::for_workspace(&path, &lookup_environment, &lookup_name)?;
+                    match store.delete(&id) {
+                        Ok(()) | Err(CredentialStoreError::NotFound) => Ok(id),
+                        Err(error) => Err(error),
+                    }
                 })
                 .await;
             let _ = view.update_in(window, |view, _, cx| {
                 view.secret_write_in_progress = false;
-                let same_environment = view
-                    .environment_manager_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.draft.name == environment);
-                if !same_environment || !view.can_manage_secret(&name) {
-                    return;
+                match result {
+                    Ok(id) => view.forget_stored_credential(&id, cx),
+                    Err(_) => {
+                        let same_environment = view
+                            .environment_manager_dialog
+                            .as_ref()
+                            .is_some_and(|dialog| dialog.draft.name == environment);
+                        if same_environment {
+                            view.show_toast(
+                                ToastIntent::Error,
+                                "Could not delete from the system credential store.",
+                                cx,
+                            );
+                            view.sync_secret_statuses_from_presence();
+                        }
+                    }
                 }
-                if result.is_err() && result != Err(CredentialStoreError::NotFound) {
-                    view.show_toast(
-                        ToastIntent::Error,
-                        "Could not delete from the system credential store.",
-                        cx,
-                    );
-                }
-                view.refresh_secret_statuses(cx);
             });
         })
         .detach();

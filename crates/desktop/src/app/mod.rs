@@ -319,8 +319,10 @@ pub(crate) struct ProbeApp {
     create_environment_dialog: Option<String>,
     environment_manager_dialog: Option<EnvironmentManagerDialog>,
     secret_value_dialog: Option<secrets::SecretValueDialog>,
-    secret_status_generation: u64,
-    secret_status_task: Option<Task<()>>,
+    editor_secret_identities: RefCell<Option<secrets::EditorSecretIdentityCache>>,
+    /// Advances when a successful Set or Delete changes credential presence.
+    /// In-flight execution reconciliation captured at an older revision is ignored.
+    credential_presence_revision: u64,
     secret_write_in_progress: bool,
     credential_store: Arc<dyn crate::credentials::CredentialStore>,
     environment_dialog_error: Option<EnvironmentDialogError>,
@@ -448,8 +450,8 @@ impl ProbeApp {
             create_environment_dialog: None,
             environment_manager_dialog: None,
             secret_value_dialog: None,
-            secret_status_generation: 0,
-            secret_status_task: None,
+            editor_secret_identities: RefCell::new(None),
+            credential_presence_revision: 0,
             secret_write_in_progress: false,
             credential_store: secrets::default_credential_store(),
             environment_dialog_error: None,

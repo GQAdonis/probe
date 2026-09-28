@@ -56,7 +56,7 @@ impl ProbeApp {
             response_cache: Some(self.response_cache.clone()),
         };
         if self.execution_service.is_none() {
-            match ExecutionService::new() {
+            match ExecutionService::with_credentials(Arc::clone(&self.credential_store)) {
                 Ok(service) => self.execution_service = Some(service),
                 Err(error) => {
                     self.execution
@@ -69,7 +69,7 @@ impl ProbeApp {
         }
         let (cancellation_sender, cancellation_receiver) = tokio::sync::oneshot::channel();
         let generation = self.execution.begin(key, cancellation_sender);
-        let (result_receiver, mut progress_receiver) =
+        let (result_receiver, mut progress_receiver, presence_receiver) =
             self.execution_service.as_ref().unwrap().execute(
                 request,
                 native_environment,
@@ -77,6 +77,14 @@ impl ProbeApp {
                 output,
                 cancellation_receiver,
             );
+        let presence_revision = self.credential_presence_revision;
+        cx.spawn(async move |view, cx| {
+            let presence = presence_receiver.await.unwrap_or_default();
+            let _ = view.update(cx, |view, cx| {
+                view.apply_secret_presence_reconciliation(presence, presence_revision, cx);
+            });
+        })
+        .detach();
 
         cx.spawn(async move |view, cx| {
             while let Some(progress) = progress_receiver.recv().await {
